@@ -5951,3 +5951,204 @@ def test_gdscript_rerun_sees_a_function_added_to_another_script(tmp_path):
     # be neither replayed from the per-file cache nor resolved through the project
     # index the first run built (one process serves many runs under watch / MCP)
     assert called() == ["take_damage()"]
+
+
+def _typed_project(tmp_path: Path) -> Path:
+    """_godot_project plus the classes the typed-receiver tests call into."""
+    root = _godot_project(tmp_path)
+    actors = root / "actors"
+    (actors / "actor.gd").write_text(
+        "class_name Actor\nextends Node\n\n\nfunc take_damage(amount: int) -> void:\n\tpass\n",
+        encoding="utf-8")
+    (actors / "monster.gd").write_text(
+        "class_name Monster\nextends Actor\n\n\nfunc hit() -> void:\n\tpass\n\n\n"
+        "func roar() -> void:\n\tpass\n", encoding="utf-8")
+    (actors / "panel.gd").write_text(
+        "class_name Panel2\nextends Control\n\n\nfunc refresh() -> void:\n\tpass\n\n\n"
+        "func redraw() -> void:\n\tpass\n", encoding="utf-8")
+    (actors / "hud.gd").write_text(
+        "class_name Hud\nextends Control\n\nsignal closed\n\nvar panel: Panel2\n\n\n"
+        "func show_x() -> void:\n\tpass\n\n\nfunc get_panel() -> Panel2:\n\treturn panel\n",
+        encoding="utf-8")
+    return root
+
+
+def _called(result: dict, src_label: str) -> set:
+    """Targets of the `calls` edges out of one function, as `<script>_<function>`."""
+    return {e["target"].rsplit("_actors_", 1)[-1] for e in _edges(result, "calls", src_label)}
+
+
+@_needs_gdscript
+def test_gdscript_call_through_a_declared_type_resolves(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "arena.gd"
+    script.write_text(
+        "extends Node\n\n@onready var hud: Hud = $Hud\nvar boss: Monster\n\n\n"
+        "func _ready() -> void:\n"
+        "\thud.show_x()\n"                  # annotated member
+        "\tboss.hit()\n"
+        "\tboss.take_damage(1)\n"           # declared by the parent script of Monster
+        "\tboss.queue_free()\n\n\n"         # an engine method: nothing to bind
+        "func strike(target: Monster, other = null) -> void:\n"
+        "\ttarget.roar()\n"                 # annotated parameter
+        "\tvar local: Hud = other\n"
+        "\tlocal.get_panel()\n"             # annotated local
+        "\tother.hit()\n", encoding="utf-8")    # untyped: stays unresolved
+    r = extract_gdscript(script)
+    assert _called(r, "_ready()") == {"hud_show_x", "monster_hit", "actor_take_damage"}
+    assert _called(r, "strike()") == {"monster_roar", "hud_get_panel"}
+    assert all(e["confidence"] == "EXTRACTED" for e in _edges(r, "calls"))
+
+
+@_needs_gdscript
+def test_gdscript_call_through_an_inferred_type_resolves(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "factory.gd"
+    script.write_text(
+        "extends Node\n\nconst Inventory = preload(\"res://actors/inventory.gd\")\n"
+        "var spare := Monster.new()\n\n\n"
+        "func build() -> void:\n"
+        "\tvar made := Monster.new()\n"
+        "\tmade.hit()\n"                    # := Class.new()
+        "\tvar slot = $Slot as Hud\n"
+        "\tslot.show_x()\n"                 # `as` cast
+        "\t(get_child(0) as Panel2).refresh()\n"
+        "\tvar bag: Inventory = Inventory.new()\n"
+        "\tbag.add_item(\"x\")\n"           # a preload const used as the type
+        "\tvar fresh := spawn()\n"
+        "\tfresh.roar()\n"                  # := a function with a return type
+        "\tspare.take_damage(1)\n\n\n"      # an inferred member
+        "func spawn() -> Monster:\n\treturn null\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _called(r, "build()") == {
+        "monster_hit", "hud_show_x", "panel_refresh", "inventory_add_item",
+        "factory_spawn", "monster_roar", "actor_take_damage"}
+
+
+@_needs_gdscript
+def test_gdscript_call_through_a_member_chain_resolves(tmp_path):
+    root = _typed_project(tmp_path)
+    (root / "autoload" / "game_state.gd").write_text(
+        "extends Node\n\nsignal paused\n\nvar hud: Hud\n\n\n"
+        "func add_score(points: int) -> void:\n\tpass\n", encoding="utf-8")
+    script = root / "actors" / "screen.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\n\n\n"
+        "func tick() -> void:\n"
+        "\thud.panel.refresh()\n"           # a typed member of a typed member
+        "\thud.get_panel().redraw()\n"      # the return type of a method
+        "\tself.hud.show_x()\n"
+        "\tMonster.new().roar()\n"          # a call on what a constructor returns
+        "\tGameState.hud.panel.redraw()\n"  # reached through an autoload
+        "\thud.panel.title.set_text(\"x\")\n", encoding="utf-8")   # Panel2 declares no title
+    r = extract_gdscript(script)
+    assert _called(r, "tick()") == {
+        "panel_refresh", "hud_get_panel", "panel_redraw", "hud_show_x", "monster_roar"}
+    assert any(e.get("context") == "instantiates" and e["target"].endswith("_actors_monster_gd")
+               for e in _edges(r, "references", "tick()"))
+
+
+@_needs_gdscript
+def test_gdscript_untyped_local_hides_a_typed_member(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "shadow.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\n\n\n"
+        "func by_parameter(hud) -> void:\n\thud.show_x()\n\n\n"
+        "func by_local() -> void:\n\tvar hud = get_node(\"x\")\n\thud.show_x()\n\n\n"
+        "func member() -> void:\n\thud.show_x()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    # the name means whatever the function declared, and that has no known type
+    assert _called(r, "by_parameter()") == set()
+    assert _called(r, "by_local()") == set()
+    assert _called(r, "member()") == {"hud_show_x"}
+
+
+@_needs_gdscript
+def test_gdscript_typed_array_types_its_elements(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "horde.gd"
+    script.write_text(
+        "extends Node\n\nvar pack: Array[Monster] = []\n\n\n"
+        "func sweep(loose: Array) -> void:\n"
+        "\tfor m in pack:\n\t\tm.hit()\n"               # element type of a typed array
+        "\tpack[0].roar()\n"
+        "\tfor k: Actor in loose:\n\t\tk.take_damage(1)\n"  # typed loop variable
+        "\tfor u in loose:\n\t\tu.hit()\n"              # untyped array: unknown
+        "\tvar each := func(z: Hud): z.show_x()\n", encoding="utf-8")    # lambda parameter
+    r = extract_gdscript(script)
+    assert _called(r, "sweep()") == {"monster_hit", "monster_roar", "actor_take_damage",
+                                     "hud_show_x"}
+
+
+@_needs_gdscript
+def test_gdscript_signal_of_a_typed_receiver_resolves(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "listener.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\n\n\n"
+        "func _ready() -> void:\n\thud.closed.connect(_on_closed)\n\n\n"
+        "func _on_closed() -> void:\n\tpass\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert [e["target"].endswith("_actors_hud_closed")
+            for e in _edges(r, "uses", "_ready()")] == [True]
+    assert [e["target"] for e in _edges(r, "references", "_ready()")] == [
+        _by_label(r, "_on_closed()")["id"]]
+
+
+@_needs_gdscript
+def test_gdscript_inner_class_does_not_borrow_the_outer_script_members(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "nested.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\n\n\n"
+        "class Row:\n\tvar hud\n\n\tfunc draw() -> void:\n\t\thud.show_x()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    # `hud` inside Row is the untyped field of Row, not the Hud of the outer script
+    assert _called(r, ".draw()") == set()
+
+
+@_needs_gdscript
+def test_gdscript_local_type_follows_its_block(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "blocks.gd"
+    script.write_text(
+        "extends Node\n\nvar thing: Hud\n\n\n"
+        "func pick(flag: bool) -> void:\n"
+        "\tif flag:\n"
+        "\t\tvar thing: Monster = null\n"
+        "\t\tthing.hit()\n"                # the Monster declared in this block
+        "\telse:\n"
+        "\t\tvar thing: Panel2 = null\n"
+        "\t\tthing.refresh()\n"            # the Panel2 declared in the other one
+        "\tthing.show_x()\n\n\n"           # both are gone: the Hud member again
+        "func before() -> void:\n"
+        "\tthing.get_panel()\n"            # not declared yet: still the member
+        "\tvar thing: Monster = null\n"
+        "\tthing.roar()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _called(r, "pick()") == {"monster_hit", "panel_refresh", "hud_show_x"}
+    assert _called(r, "before()") == {"hud_get_panel", "monster_roar"}
+
+
+@_needs_gdscript
+def test_gdscript_rerun_sees_a_type_added_to_another_script(tmp_path):
+    from graphify.extract import extract
+    (tmp_path / "proj").mkdir()
+    root = _typed_project(tmp_path / "proj")
+    hud = root / "actors" / "hud.gd"
+    hud.write_text("class_name Hud\nextends Control\n\nvar panel\n", encoding="utf-8")
+    (root / "actors" / "screen.gd").write_text(
+        "extends Node\n\nvar hud: Hud\n\n\nfunc tick() -> void:\n\thud.panel.refresh()\n",
+        encoding="utf-8")
+    paths = sorted(root.rglob("*.gd"))
+
+    def called() -> list:
+        r = extract(paths, cache_root=tmp_path / "cache", root=root, parallel=False)
+        label = {n["id"]: n["label"] for n in r["nodes"]}
+        return [label.get(e["target"]) for e in r["edges"] if e["relation"] == "calls"]
+
+    assert called() == []
+    hud.write_text("class_name Hud\nextends Control\n\nvar panel: Panel2\n", encoding="utf-8")
+    # screen.gd is unchanged; the member type it reads through hud.gd is not
+    assert called() == ["refresh()"]
