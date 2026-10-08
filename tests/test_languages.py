@@ -6274,7 +6274,7 @@ def test_gdscript_node_path_is_typed_by_the_scene(tmp_path):
 
 
 @_needs_gdscript
-def test_gdscript_node_path_needs_every_scene_to_agree(tmp_path):
+def test_gdscript_node_path_is_certain_only_when_every_scene_agrees(tmp_path):
     root = _scene_project(tmp_path)
     # the same script on a second scene, where `Boss` is a Hud instead of a Monster
     (root / "scenes" / "arena_b.tscn").write_text(
@@ -6292,7 +6292,8 @@ def test_gdscript_node_path_needs_every_scene_to_agree(tmp_path):
         "\t$Boss.hit()\n"                       # Monster in one scene, Hud in the other
         "\t$Layer/Hud.show_x()\n", encoding="utf-8")   # a Hud in both
     r = extract_gdscript(script)
-    assert _called(r, "_ready()") == {"hud_show_x"}
+    assert _confidence(r, "calls", "_ready()") == {"hud_show_x": "EXTRACTED",
+                                                  "monster_hit": "INFERRED"}
     # a script no scene uses has no node to look a path up in
     loose = root / "actors" / "loose.gd"
     loose.write_text("extends Node\n\n\nfunc _ready() -> void:\n\t$Layer/Hud.show_x()\n",
@@ -6395,11 +6396,12 @@ def test_gdscript_node_navigation_is_typed_by_the_scene(tmp_path):
     assert _short(monster, "calls", "hit()") == {"arena_begin", "hud_show_x", "panel_redraw"}
     panel = extract_gdscript(root / "actors" / "panel.gd")
     assert _short(panel, "calls", "refresh()") == {"arena_begin", "monster_roar"}
-    # hud.gd sits in two scenes whose roots differ: its owner is not one thing
+    # hud.gd sits in two scenes whose roots differ: its owner is either of them
     hud = root / "actors" / "hud.gd"
     hud.write_text(hud.read_text(encoding="utf-8")
                    + "\n\nfunc ask() -> void:\n\towner.begin()\n\towner.refresh()\n", encoding="utf-8")
-    assert _short(extract_gdscript(hud), "calls", "ask()") == set()
+    assert _confidence(extract_gdscript(hud), "calls", "ask()") == {
+        "arena_begin": "INFERRED", "panel_refresh": "INFERRED"}
 
 
 @_needs_gdscript
@@ -6441,3 +6443,133 @@ def test_gdscript_return_type_survives_nested_parentheses_in_defaults(tmp_path):
         "extends Node\n\nvar maker: Maker\n\n\nfunc run() -> void:\n\tmaker.make().roar()\n",
         encoding="utf-8")
     assert _short(extract_gdscript(script), "calls", "run()") == {"maker_make", "monster_roar"}
+
+
+def _confidence(result: dict, relation: str, src_label: str) -> dict:
+    """`<script>_<symbol>` -> confidence, for one function's edges of one relation."""
+    out = {}
+    for e in _edges(result, relation, src_label):
+        for marker in ("_actors_", "_autoload_"):
+            if marker in e["target"]:
+                out[e["target"].rsplit(marker, 1)[-1]] = e["confidence"]
+    return out
+
+
+@_needs_gdscript
+def test_gdscript_node_that_differs_between_scenes_yields_every_candidate(tmp_path):
+    root = _scene_project(tmp_path)
+    (root / "actors" / "arena.gd").write_text(
+        "extends Node2D\n\n\nfunc begin() -> void:\n\tpass\n\n\nfunc shared() -> void:\n\tpass\n",
+        encoding="utf-8")
+    (root / "actors" / "panel.gd").write_text(
+        "class_name Panel2\nextends Control\n\n\nfunc refresh() -> void:\n\tpass\n\n\n"
+        "func redraw() -> void:\n\tpass\n\n\nfunc shared() -> void:\n\tpass\n", encoding="utf-8")
+    # hud.gd sits under arena.tscn (root: arena.gd) and under popup.tscn (root: panel.gd)
+    hud = root / "actors" / "hud.gd"
+    hud.write_text(
+        hud.read_text(encoding="utf-8")
+        + "\n\nfunc ask() -> void:\n"
+        "\towner.begin()\n"         # only the arena root has it
+        "\towner.refresh()\n"       # only the popup root has it
+        "\towner.shared()\n"        # both do: either may be the one called
+        "\towner.nothing()\n", encoding="utf-8")
+    r = extract_gdscript(hud)
+    # a call that depends on which scene the script is in is never EXTRACTED
+    assert _confidence(r, "calls", "ask()") == {
+        "arena_begin": "INFERRED", "panel_refresh": "INFERRED",
+        "arena_shared": "INFERRED", "panel_shared": "INFERRED"}
+
+
+@_needs_gdscript
+def test_gdscript_exported_node_path_is_read_from_the_scene(tmp_path):
+    root = _scene_project(tmp_path)
+    arena = root / "scenes" / "arena.tscn"
+    arena.write_text(
+        arena.read_text(encoding="utf-8").replace(
+            '[ext_resource type="PackedScene"',
+            '[ext_resource type="Script" path="res://actors/flow.gd" id="9"]\n'
+            '[ext_resource type="PackedScene"')
+        + '\n[node name="Flow" type="Node" parent="." node_paths=PackedStringArray("target")]\n'
+        'script = ExtResource("9")\nhud_path = NodePath("../Layer/Hud")\n'
+        'target = NodePath("../Boss")\n', encoding="utf-8")
+    flow = root / "actors" / "flow.gd"
+    flow.write_text(
+        "class_name Flow\nextends Node\n\n@export var hud_path: NodePath\n"
+        "@export var popup_path: NodePath = ^\"../Popup\"\n"     # no scene sets it: the default
+        "@export var target: Node2D\n"                          # an exported node reference
+        "@export var loose: Node\n"                             # ... that no scene fills
+        "var _hud: Node\n\n\n"
+        "func _ready() -> void:\n\t_hud = get_node(hud_path)\n\n\n"
+        "func go() -> void:\n"
+        "\t_hud.show_x()\n"                     # typed by what _ready assigns to it
+        "\tget_node(hud_path).get_panel()\n"
+        "\tget_node_or_null(popup_path).refresh()\n"
+        "\ttarget.hit()\n"
+        "\tloose.hit()\n", encoding="utf-8")
+    r = extract_gdscript(flow)
+    assert _confidence(r, "calls", "go()") == {
+        "hud_show_x": "EXTRACTED", "hud_get_panel": "EXTRACTED", "panel_refresh": "EXTRACTED",
+        "monster_hit": "EXTRACTED"}
+    # ... and from another script, through a member typed as that class
+    user = root / "actors" / "user.gd"
+    user.write_text("extends Node\n\nvar flow: Flow\n\n\nfunc poke() -> void:\n\tflow._hud.show_x()\n",
+                    encoding="utf-8")
+    assert _confidence(extract_gdscript(user), "calls", "poke()") == {"hud_show_x": "EXTRACTED"}
+
+
+@_needs_gdscript
+def test_gdscript_tree_root_and_current_scene(tmp_path):
+    root = _scene_project(tmp_path)
+    settings = root / "project.godot"
+    settings.write_text(settings.read_text(encoding="utf-8").replace(
+        "[application]\n", "[application]\n\nrun/main_scene=\"res://scenes/popup.tscn\"\n"),
+        encoding="utf-8")
+    (root / "actors" / "arena.gd").write_text(
+        "extends Node2D\n\n\nfunc begin() -> void:\n\tpass\n", encoding="utf-8")
+    (root / "actors" / "boot.gd").write_text(
+        "extends Node\n\nconst ARENA := \"res://scenes/arena.tscn\"\n\n\n"
+        "func start() -> void:\n\tget_tree().change_scene_to_packed(load(ARENA))\n", encoding="utf-8")
+    script = root / "actors" / "service.gd"
+    script.write_text(
+        "extends Node\n\n\nfunc ping() -> void:\n"
+        "\tget_tree().root.get_node(\"GameState\").add_score(1)\n"  # an autoload, by the tree root
+        "\tget_tree().current_scene.begin()\n"          # the arena, which boot.gd changes to
+        "\tget_tree().current_scene.refresh()\n"        # the popup, the project's main scene
+        "\tget_tree().root.get_node(\"Nope\").add_score(1)\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _confidence(r, "calls", "ping()") == {
+        "game_state_add_score": "EXTRACTED", "arena_begin": "INFERRED", "panel_refresh": "INFERRED"}
+
+
+@_needs_gdscript
+def test_gdscript_find_child_looks_into_instanced_scenes(tmp_path):
+    root = _scene_project(tmp_path)
+    (root / "actors" / "arena.gd").write_text(
+        "extends Node2D\n\n\nfunc begin() -> void:\n"
+        "\tfind_child(\"Close\").get_panel()\n"     # declared by popup.tscn, instanced at Popup
+        "\t$Popup.find_child(\"Close\").show_x()\n"
+        "\t$Layer.find_child(\"Close\").closed.emit()\n", encoding="utf-8")   # not under Layer
+    r = extract_gdscript(root / "actors" / "arena.gd")
+    assert _confidence(r, "calls", "begin()") == {"hud_get_panel": "EXTRACTED",
+                                                 "hud_show_x": "EXTRACTED"}
+    assert _edges(r, "uses", "begin()") == []
+
+
+@_needs_gdscript
+def test_gdscript_member_typed_by_what_is_assigned_to_it(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "service.gd"
+    script.write_text(
+        "extends Node\n\nvar only\nvar swapped: Object = null\nvar mixed\n\n\n"
+        "func _ready() -> void:\n"
+        "\tonly = Monster.new()\n"          # the one thing ever assigned
+        "\tswapped = Hud.new()\n"
+        "\tmixed = Monster.new()\n"
+        "\tmixed = Hud.new()\n\n\n"         # two different things: nothing to say
+        "func inject(other) -> void:\n"
+        "\tswapped = other\n"               # ... but something unknown is assigned too
+        "\tonly = null\n\n\n"               # clearing it changes nothing
+        "func use() -> void:\n"
+        "\tonly.hit()\n\tswapped.show_x()\n\tmixed.hit()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _confidence(r, "calls", "use()") == {"monster_hit": "EXTRACTED", "hud_show_x": "INFERRED"}

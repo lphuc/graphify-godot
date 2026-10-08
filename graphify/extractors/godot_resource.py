@@ -49,6 +49,7 @@ _SECTION_RE = re.compile(r'^\[(?P<kind>[a-z_]+)(?P<attrs>(?:\s.*)?)\]\s*$')
 _ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|(\w+\([^)]*\)))')
 _PROP_RE = re.compile(r'^\s*(?P<key>[\w/]+)\s*=\s*(?P<val>.+?)\s*$')
 _EXTRES_CALL_RE = re.compile(r'ExtResource\(\s*"?([^")]+)"?\s*\)')
+_NODE_PATH_RE = re.compile(r'^NodePath\("([^"]+)"\)$')     # a property holding a node path
 
 
 class _Block:
@@ -284,14 +285,18 @@ _SCRIPT_SITES_CACHE: dict[Path, dict[Path, list[tuple[Path, str]]]] = {}
 
 
 class _SceneTree:
-    """The nodes one ``.tscn`` declares — path from the scene root -> (its
-    script, the scene it instances) — and the paths of its scene-unique names."""
+    """What one ``.tscn`` declares. ``nodes``: path from the scene root -> (its
+    script, the scene it instances), in file order. ``unique``: scene-unique
+    name -> path. ``paths``: node -> its properties holding a ``NodePath``.
+    ``refs``: node -> which of those are exported node references."""
 
-    __slots__ = ("nodes", "unique")
+    __slots__ = ("nodes", "unique", "paths", "refs")
 
     def __init__(self) -> None:
         self.nodes: dict[str, tuple[Path | None, Path | None]] = {}
         self.unique: dict[str, str] = {}
+        self.paths: dict[str, dict[str, str]] = {}
+        self.refs: dict[str, set[str]] = {}
 
 
 def _scene_tree(scene: Path) -> _SceneTree | None:
@@ -328,8 +333,14 @@ def _scene_tree(scene: Path) -> _SceneTree | None:
                     script = resource(val)
                 elif key == "unique_name_in_owner" and val.strip() == "true":
                     tree.unique[name] = node_path
+                else:
+                    held = _NODE_PATH_RE.match(val.strip())
+                    if held:
+                        tree.paths.setdefault(node_path, {})[key] = held.group(1)
             if script is not None and script.suffix.lower() != ".gd":
                 script = None
+            # node_paths=PackedStringArray("target", ...): exported node references
+            tree.refs[node_path] = set(re.findall(r'"([^"]+)"', block.attrs.get("node_paths", "")))
             tree.nodes[node_path] = (script, resource(block.attrs.get("instance", "")))
     _SCENE_TREE_CACHE[scene] = tree
     return tree
@@ -370,6 +381,28 @@ def _unique_node(scene: Path, name: str, depth: int = 0) -> str | None:
     return _unique_node(base, name, depth + 1) if base is not None else None
 
 
+def _descendants(scene: Path, under: str, depth: int = 0) -> list[str]:
+    """Paths of every node below ``under`` in ``scene``, in tree order, with the
+    nodes of instanced and inherited scenes spliced in where they sit."""
+    tree = _scene_tree(scene) if depth < 6 else None
+    if tree is None:
+        return []
+    out: list[str] = []
+    base = tree.nodes.get(".", (None, None))[1]
+    if base is not None:
+        out += _descendants(base, ".", depth + 1)           # what the scene inherits
+    for path, (_script, instance) in tree.nodes.items():
+        if path == ".":
+            continue
+        if path not in out:
+            out.append(path)
+        if instance is not None:
+            out += [f"{path}/{inner}" for inner in _descendants(instance, ".", depth + 1)
+                    if f"{path}/{inner}" not in out]
+    prefix = "" if under == "." else under + "/"
+    return [p for p in out if p.startswith(prefix)]
+
+
 def _scene_maps(project) -> tuple[dict, dict]:
     """Two maps of a project's scenes. ``sites``: script -> every (scene, node
     path) it runs on — where the script itself is attached, and where one
@@ -397,46 +430,103 @@ def _scene_maps(project) -> tuple[dict, dict]:
     return maps
 
 
-def _node_step(project, scene: Path, path: str, segment: str) -> set[tuple[Path, str]] | None:
-    """The (scene, node path) places one path segment leads to from a node:
-    a child name, ``..``, ``%Unique``, ``:owner`` (the node's owner) or
-    ``:find:Name`` (its one descendant of that name). None when it leads nowhere known."""
-    if segment in ("", "."):
-        return {(scene, path)}
-    if segment in ("..", ":owner"):
-        if path != ".":
-            return {(scene, "." if segment == ":owner" else path.rpartition("/")[0] or ".")}
-        # above a scene's root: wherever that scene is instanced
-        return {(host, "." if segment == ":owner" else at.rpartition("/")[0] or ".")
-                for host, at in _scene_maps(project)[1].get(scene, ())} or None
-    if segment.startswith("%"):
-        unique = _unique_node(scene, segment[1:])
-        return {(scene, unique)} if unique is not None else None
-    if segment.startswith(":find:"):
-        tree = _scene_tree(scene)
-        under = "" if path == "." else path + "/"
-        named = [p for p in (tree.nodes if tree else ())
-                 if p != "." and p.startswith(under) and p.rpartition("/")[2] == segment[6:]]
-        return {(scene, named[0])} if len(named) == 1 else None
-    return {(scene, segment if path == "." else f"{path}/{segment}")}
+def _current_scenes(project) -> set[tuple[Path, str]]:
+    """The roots ``get_tree().current_scene`` can be: the project's main scene,
+    and every scene named by a script that changes scenes."""
+    scenes: set[Path] = set()
+    try:
+        settings = (project.root / "project.godot").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        settings = ""
+    main = re.search(r'^run/main_scene="(res://[^"\n]+)"', settings, re.M)
+    if main:
+        scenes.add(project.root / main.group(1)[len("res://"):])
+    for script in _project_files(project.root, (".gd",)):
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "change_scene_to_" in text:
+            scenes.update(project.root / ref[len("res://"):]
+                          for ref in re.findall(r'"(res://[^"\n]+\.tscn)"', text))
+    return {(scene, ".") for scene in scenes if scene.is_file()}
 
 
-def _node_script_for(script: Path, ref: str, project) -> Path | None:
-    """The script on the node that ``script`` reaches as ``$ref`` (``A/B``,
-    ``../C``, ``%Unique/D``, and the ``:owner`` / ``:find:Name`` steps). Known
-    only when every scene using ``script`` puts the same script there; a script
-    no scene uses has no node to look the path up from."""
-    places = set(_scene_maps(project)[0].get(script, ()))
-    for segment in ref.split("/"):
-        stepped: set[tuple[Path, str]] = set()
+def _walk_path(project, places: set[tuple[Path, str]], steps) -> tuple[set[tuple[Path, str]], bool]:
+    """Take ``steps`` from each of ``places``. Returns where they lead, and
+    whether every place could take every step."""
+    complete = True
+    for step in steps:
+        reached: set[tuple[Path, str]] = set()
         for scene, path in places:
-            reached = _node_step(project, scene, path, segment)
-            if reached is None:
-                return None
-            stepped |= reached
-        places = stepped
+            there = _node_step(project, scene, path, step)
+            if there:
+                reached |= there
+            else:
+                complete = False
+        places = reached
+    return places, complete
+
+
+def _node_step(project, scene: Path, path: str, step) -> set[tuple[Path, str]] | None:
+    """The (scene, node path) places one step leads to from a node. A string is
+    a path segment — a child name, ``..`` or ``%Unique``. A tuple is ``("owner",)``
+    (the node's owner), ``("find", name)`` (its first descendant of that name) or
+    ``("prop", name, default, reference)``: the node a ``NodePath`` property of
+    this node points to — ``reference`` asking for an exported node reference,
+    ``default`` standing in when no scene sets the property. None: nowhere known."""
+    if step in ("", "."):
+        return {(scene, path)}
+    if step in ("..", ("owner",)):
+        up = step == ".."
+        if path != ".":
+            return {(scene, (path.rpartition("/")[0] or ".") if up else ".")}
+        # above a scene's root: wherever that scene is instanced
+        return {(host, (at.rpartition("/")[0] or ".") if up else ".")
+                for host, at in _scene_maps(project)[1].get(scene, ())} or None
+    if isinstance(step, str):
+        if step.startswith("%"):
+            unique = _unique_node(scene, step[1:])
+            return {(scene, unique)} if unique is not None else None
+        return {(scene, step if path == "." else f"{path}/{step}")}
+    if step[0] == "find":
+        named = [p for p in _descendants(scene, path) if p.rpartition("/")[2] == step[1]]
+        return {(scene, named[0])} if named else None       # find_child returns the first
+    if step[0] == "prop":
+        _kind, name, default, reference = step
+        tree = _scene_tree(scene)
+        # set on the node itself, else on the node of each scene instancing this one
+        holders = [(scene, path)]
+        if path == ".":
+            holders += _scene_maps(project)[1].get(scene, ())
+        reached: set[tuple[Path, str]] = set()
+        for at_scene, at_path in holders:
+            at_tree = tree if at_scene == scene else _scene_tree(at_scene)
+            held = at_tree.paths.get(at_path, {}).get(name) if at_tree else None
+            if held is None or (reference and name not in at_tree.refs.get(at_path, ())):
+                continue
+            there, _complete = _walk_path(project, {(at_scene, at_path)}, held.split("/"))
+            reached |= there
+        if not reached and default is not None and not reference:
+            reached, _complete = _walk_path(project, {(scene, path)}, default.split("/"))
+        return reached or None
+    return None
+
+
+def _node_scripts_for(script: Path, steps, project) -> tuple[set[Path], bool]:
+    """The scripts on the node(s) that ``script`` reaches by ``steps`` — one per
+    scene ``script`` runs in, when they differ — and whether that is certain:
+    every place the script runs led to a scripted node. A script no scene uses
+    has no node to start from. ``("current",)`` as the first step starts from
+    the scenes that can be the tree's current scene instead."""
+    if steps and steps[0] == ("current",):
+        places, steps, complete = _current_scenes(project), steps[1:], False
+    else:
+        places, complete = set(_scene_maps(project)[0].get(script, ())), True
+    places, walked = _walk_path(project, places, steps)
     found = {_node_script(scene, path) for scene, path in places}
-    return next(iter(found)) if len(found) == 1 else None
+    scripts = {s for s in found if s is not None}
+    return scripts, complete and walked and len(found) == 1 and len(scripts) == 1
 
 
 # ---------------------------------------------------------------------------
