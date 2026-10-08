@@ -40,13 +40,13 @@ from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id
 from graphify.extractors.gdscript import (
-    _RESOURCE_SUFFIXES, _ancestors, _file_index, _project_for, _resource_nid,
+    _RESOURCE_SUFFIXES, _ancestors, _file_index, _project_files, _project_for, _resource_nid,
 )
 
 # greedy up to the LAST ``]`` of the line, so a ``]`` inside a quoted value
 # (``name="Odd]Name"``) or a ``binds= [1, 2]`` array stays in the header
 _SECTION_RE = re.compile(r'^\[(?P<kind>[a-z_]+)(?P<attrs>(?:\s.*)?)\]\s*$')
-_ATTR_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+_ATTR_RE = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|(\w+\([^)]*\)))')
 _PROP_RE = re.compile(r'^\s*(?P<key>[\w/]+)\s*=\s*(?P<val>.+?)\s*$')
 _EXTRES_CALL_RE = re.compile(r'ExtResource\(\s*"?([^")]+)"?\s*\)')
 
@@ -135,7 +135,7 @@ def _edge(src: str, tgt: str, relation: str, path: Path, loc: str | None,
 
 
 def _parse_attrs(attr_str: str) -> dict:
-    return {k: v for k, v in _ATTR_RE.findall(attr_str)}
+    return {k: call or text for k, text, call in _ATTR_RE.findall(attr_str)}
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +273,156 @@ def _blocks(text: str) -> list[_Block]:
     if blocks is None:
         blocks = _blocks_from_lines(text)
     return blocks
+
+
+# ---------------------------------------------------------------------------
+# Scene trees: which script sits on which node, for typing `$Path` in GDScript
+# ---------------------------------------------------------------------------
+
+_SCENE_TREE_CACHE: dict[Path, "_SceneTree | None"] = {}
+_SCRIPT_SITES_CACHE: dict[Path, dict[Path, list[tuple[Path, str]]]] = {}
+
+
+class _SceneTree:
+    """The nodes one ``.tscn`` declares — path from the scene root -> (its
+    script, the scene it instances) — and the paths of its scene-unique names."""
+
+    __slots__ = ("nodes", "unique")
+
+    def __init__(self) -> None:
+        self.nodes: dict[str, tuple[Path | None, Path | None]] = {}
+        self.unique: dict[str, str] = {}
+
+
+def _scene_tree(scene: Path) -> _SceneTree | None:
+    if scene in _SCENE_TREE_CACHE:
+        return _SCENE_TREE_CACHE[scene]
+    try:
+        text = scene.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        _SCENE_TREE_CACHE[scene] = None
+        return None
+    root = _project_root(scene)
+    tree = _SceneTree()
+    ext: dict[str, Path | None] = {}
+
+    def resource(call: str) -> Path | None:
+        m = _EXTRES_CALL_RE.search(call)
+        return ext.get(m.group(1)) if m else None
+
+    for block in _blocks(text):
+        if block.kind == "ext_resource":
+            ext[block.attrs.get("id", "")] = _resolve_res(block.attrs.get("path", ""), root)
+        elif block.kind == "node":
+            name = block.attrs.get("name", "")
+            parent = block.attrs.get("parent")
+            if parent is None:
+                node_path = "."                 # scene root
+            elif parent == ".":
+                node_path = name
+            else:
+                node_path = f"{parent}/{name}"
+            script = None
+            for key, val, _loc in block.props:
+                if key == "script":
+                    script = resource(val)
+                elif key == "unique_name_in_owner" and val.strip() == "true":
+                    tree.unique[name] = node_path
+            if script is not None and script.suffix.lower() != ".gd":
+                script = None
+            tree.nodes[node_path] = (script, resource(block.attrs.get("instance", "")))
+    _SCENE_TREE_CACHE[scene] = tree
+    return tree
+
+
+def _node_script(scene: Path, node_path: str, depth: int = 0) -> Path | None:
+    """Script of the node at ``node_path`` of ``scene``: its own, or the root
+    script of the scene it instances. A path that leads into an instanced
+    scene, or to a node an inherited scene gets from its base, is followed there."""
+    tree = _scene_tree(scene) if depth < 8 else None
+    if tree is None:
+        return None
+    if node_path in tree.nodes:
+        script, instance = tree.nodes[node_path]
+        if script is not None:
+            return script
+        if instance is not None:
+            return _node_script(instance, ".", depth + 1)
+    segments = node_path.split("/")
+    for cut in range(len(segments) - 1, 0, -1):
+        owner = tree.nodes.get("/".join(segments[:cut]))
+        if owner is not None and owner[1] is not None:
+            return _node_script(owner[1], "/".join(segments[cut:]), depth + 1)
+    base = tree.nodes.get(".", (None, None))[1]
+    if base is not None and node_path != ".":
+        return _node_script(base, node_path, depth + 1)     # an inherited scene
+    return None
+
+
+def _unique_node(scene: Path, name: str, depth: int = 0) -> str | None:
+    """Path of the scene-unique node ``%name`` of ``scene`` or of the scene it inherits."""
+    tree = _scene_tree(scene) if depth < 8 else None
+    if tree is None:
+        return None
+    if name in tree.unique:
+        return tree.unique[name]
+    base = tree.nodes.get(".", (None, None))[1]
+    return _unique_node(base, name, depth + 1) if base is not None else None
+
+
+def _join_node_path(scene: Path, base: str, ref: str) -> str | None:
+    """``ref`` (``A/B``, ``../C``, ``%Unique/D``) as a path from the scene root,
+    for a script sitting on node ``base`` of ``scene``."""
+    if ref.startswith("/"):
+        return None                     # absolute: outside this scene
+    parts = [] if base == "." else base.split("/")
+    segments = ref.split("/")
+    if segments[0].startswith("%"):
+        unique = _unique_node(scene, segments[0][1:])
+        if unique is None:
+            return None
+        parts = [] if unique == "." else unique.split("/")
+        segments = segments[1:]
+    for segment in segments:
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if not parts:
+                return None             # above the scene root
+            parts.pop()
+        elif segment.startswith("%"):
+            return None
+        else:
+            parts.append(segment)
+    return "/".join(parts) or "."
+
+
+def _script_sites(project) -> dict[Path, list[tuple[Path, str]]]:
+    """Every (scene, node path) a script runs on: where the script itself is
+    attached, and where one extending it is — its ``$Path`` is looked up there too."""
+    sites = _SCRIPT_SITES_CACHE.get(project.root)
+    if sites is None:
+        sites = _SCRIPT_SITES_CACHE[project.root] = {}
+        for scene in sorted(_project_files(project.root, (".tscn",))):
+            tree = _scene_tree(scene)
+            for node_path, (script, _instance) in (tree.nodes.items() if tree else ()):
+                if script is not None:
+                    for holder in (script, *_ancestors(script, project)):
+                        sites.setdefault(holder, []).append((scene, node_path))
+    return sites
+
+
+def _node_script_for(script: Path, ref: str, project) -> Path | None:
+    """The script on the node that ``script`` reaches as ``$ref``. Known only
+    when every scene using ``script`` puts the same script there; a script no
+    scene uses has no node to look the path up in."""
+    found: set[Path | None] = set()
+    for scene, node_path in _script_sites(project).get(script, ()):
+        target = _join_node_path(scene, node_path, ref)
+        found.add(_node_script(scene, target) if target is not None else None)
+        if len(found) > 1:
+            return None
+    return next(iter(found)) if found else None
 
 
 # ---------------------------------------------------------------------------

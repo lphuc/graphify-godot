@@ -57,7 +57,11 @@ from graphify.extractors.gdscript import (  # noqa: F401
     _PROJECT_CACHE as _GDSCRIPT_PROJECT_CACHE,
     _TYPE_INDEX_CACHE as _GDSCRIPT_TYPE_INDEX_CACHE,
 )
-from graphify.extractors.godot_resource import extract_godot_resource  # noqa: F401
+from graphify.extractors.godot_resource import (  # noqa: F401
+    extract_godot_resource,
+    _SCENE_TREE_CACHE as _GODOT_SCENE_TREE_CACHE,
+    _SCRIPT_SITES_CACHE as _GODOT_SCRIPT_SITES_CACHE,
+)
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
@@ -7679,12 +7683,15 @@ def extract(
     _XAML_CSHARP_CLASS_CACHE.clear()
     _MD_LINK_INDEX_CACHE.clear()
     # The GDScript project index (class_name / autoload / uid tables, per-script
-    # func and signal names, declared member and return types) is the same kind
-    # of state: a script edited between two runs of one process must not be
-    # resolved through the previous index.
+    # func and signal names, declared member and return types, the scene trees
+    # node paths are typed from) is the same kind of state: a script or scene
+    # edited between two runs of one process must not be resolved through the
+    # previous index.
     _GDSCRIPT_PROJECT_CACHE.clear()
     _GDSCRIPT_FILE_INDEX_CACHE.clear()
     _GDSCRIPT_TYPE_INDEX_CACHE.clear()
+    _GODOT_SCENE_TREE_CACHE.clear()
+    _GODOT_SCRIPT_SITES_CACHE.clear()
     _SCAN_ROOT_NAMESPACE_CACHE.clear()
     # Path-resolution memoization (#3500) is keyed by (path, cwd) with no mtime
     # component, so — like the alias caches above — a symlink repoint or a path

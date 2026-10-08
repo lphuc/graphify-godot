@@ -6152,3 +6152,178 @@ def test_gdscript_rerun_sees_a_type_added_to_another_script(tmp_path):
     hud.write_text("class_name Hud\nextends Control\n\nvar panel: Panel2\n", encoding="utf-8")
     # screen.gd is unchanged; the member type it reads through hud.gd is not
     assert called() == ["refresh()"]
+
+
+@_needs_gdscript
+def test_gdscript_return_type_of_a_multi_line_signature_is_read(tmp_path):
+    root = _typed_project(tmp_path)
+    (root / "actors" / "spawner.gd").write_text(
+        "class_name Spawner\nextends Node\n\n\n"
+        "func spawn(\n\t\tkind: String,\n\t\tat := Vector2(1, 2),\n) -> Monster:\n\treturn null\n\n\n"
+        "func plain(\n\t\tkind: String,\n):\n\tpass\n\n\n"
+        "func after() -> Hud:\n\treturn null\n", encoding="utf-8")
+    script = root / "actors" / "wave.gd"
+    script.write_text(
+        "extends Node\n\nvar spawner: Spawner\n\n\n"
+        "func start() -> void:\n"
+        "\tspawner.spawn(\"a\").roar()\n"
+        "\tspawner.plain(\"a\").hit()\n"        # no return type: must not borrow the next one
+        "\tspawner.after().show_x()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _called(r, "start()") == {"spawner_spawn", "monster_roar", "spawner_plain",
+                                     "spawner_after", "hud_show_x"}
+
+
+@_needs_gdscript
+def test_gdscript_inner_class_is_a_type(tmp_path):
+    root = _typed_project(tmp_path)
+    (root / "actors" / "grid.gd").write_text(
+        "class_name Grid\nextends Node\n\n\n"
+        "class Cell:\n\tvar owner_hud: Hud\n\n\tfunc paint() -> void:\n\t\towner_hud.show_x()\n\n\n"
+        "class Tile extends Cell:\n\tfunc flip() -> void:\n\t\tpaint()\n\n\n"
+        "func first() -> Cell:\n\treturn null\n", encoding="utf-8")
+    script = root / "actors" / "board.gd"
+    script.write_text(
+        "extends Node\n\n\n"
+        "class Row:\n\tvar boss: Monster\n\n\tfunc draw() -> void:\n\t\tboss.hit()\n\n\n"
+        "var row: Row\nvar grid: Grid\n\n\n"
+        "func build() -> void:\n"
+        "\trow.draw()\n"                        # an inner class of this script
+        "\tvar fresh := Row.new()\n"
+        "\tfresh.boss.roar()\n"                 # ... and a typed member of it
+        "\tvar tile: Grid.Tile = null\n"
+        "\ttile.flip()\n"                       # an inner class of another script
+        "\ttile.paint()\n"                      # ... inherited from the inner class it extends
+        "\tgrid.first().paint()\n", encoding="utf-8")   # a return type naming an inner class
+    r = extract_gdscript(script)
+    assert _called(r, "build()") == {"board_row_draw", "monster_roar", "grid_tile_flip",
+                                     "grid_cell_paint", "grid_first"}
+    assert _called(r, ".draw()") == {"monster_hit"}
+    assert any(e.get("context") == "instantiates" and e["target"] == _by_label(r, "Row")["id"]
+               for e in _edges(r, "references", "build()"))
+    grid = extract_gdscript(root / "actors" / "grid.gd")
+    assert _called(grid, ".paint()") == {"hud_show_x"}
+    assert _called(grid, ".flip()") == {"grid_cell_paint"}
+
+
+@_needs_gdscript
+def test_gdscript_typed_dictionary_types_its_keys_and_values(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "registry.gd"
+    script.write_text(
+        "extends Node\n\nvar by_name: Dictionary[String, Hud] = {}\n"
+        "var score: Dictionary[Monster, int] = {}\n\n\n"
+        "func tally() -> void:\n"
+        "\tby_name[\"a\"].show_x()\n"           # a value
+        "\tfor m in score:\n\t\tm.hit()\n"      # iterating a dictionary yields its keys
+        "\tscore[null].hit()\n", encoding="utf-8")   # an int value: nothing to bind
+    r = extract_gdscript(script)
+    assert _called(r, "tally()") == {"hud_show_x", "monster_hit"}
+
+
+def _scene_project(tmp_path: Path) -> Path:
+    """_typed_project plus scenes: arena.tscn (root: arena.gd) holds a Hud node, a
+    unique Boss, and a Popup instanced from popup.tscn (root: panel.gd, child Close: hud.gd)."""
+    root = _typed_project(tmp_path)
+    (root / "scenes").mkdir()
+    (root / "scenes" / "popup.tscn").write_text(
+        '[gd_scene format=3]\n\n'
+        '[ext_resource type="Script" path="res://actors/panel.gd" id="1"]\n'
+        '[ext_resource type="Script" path="res://actors/hud.gd" id="2"]\n\n'
+        '[node name="Popup" type="Control"]\nscript = ExtResource("1")\n\n'
+        '[node name="Close" type="Control" parent="."]\nscript = ExtResource("2")\n',
+        encoding="utf-8")
+    (root / "scenes" / "arena.tscn").write_text(
+        '[gd_scene format=3]\n\n'
+        '[ext_resource type="Script" path="res://actors/arena.gd" id="1"]\n'
+        '[ext_resource type="Script" path="res://actors/hud.gd" id="2"]\n'
+        '[ext_resource type="Script" path="res://actors/monster.gd" id="3"]\n'
+        '[ext_resource type="PackedScene" path="res://scenes/popup.tscn" id="4"]\n\n'
+        '[node name="Arena" type="Node2D"]\nscript = ExtResource("1")\n\n'
+        '[node name="Layer" type="CanvasLayer" parent="."]\n\n'
+        '[node name="Hud" type="Control" parent="Layer"]\nscript = ExtResource("2")\n\n'
+        '[node name="Boss" type="Node2D" parent="."]\nunique_name_in_owner = true\n'
+        'script = ExtResource("3")\n\n'
+        '[node name="Popup" parent="." instance=ExtResource("4")]\n\n'
+        '[node name="Plain" type="Label" parent="."]\n', encoding="utf-8")
+    return root
+
+
+@_needs_gdscript
+def test_gdscript_node_path_is_typed_by_the_scene(tmp_path):
+    root = _scene_project(tmp_path)
+    script = root / "actors" / "arena.gd"
+    script.write_text(
+        "extends Node2D\n\n@onready var hud_node: Control = $Layer/Hud\n"
+        "@onready var label: Label = $Plain\n\n\n"
+        "func _ready() -> void:\n"
+        "\t$Layer/Hud.show_x()\n"               # a node with a script
+        "\t%Boss.hit()\n"                       # a scene-unique name
+        "\t$Popup.refresh()\n"                  # an instanced scene: its root script
+        "\t$Popup/Close.get_panel()\n"          # a node inside the instanced scene
+        "\tget_node(\"Boss\").roar()\n"
+        "\thud_node.closed.connect(_on_closed)\n"   # an engine-typed member bound to a scripted node
+        "\tlabel.show_x()\n"                    # a plain Label: no script
+        "\t$Missing.show_x()\n\n\n"
+        "func _on_closed() -> void:\n\tpass\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _called(r, "_ready()") == {"hud_show_x", "monster_hit", "panel_refresh",
+                                      "hud_get_panel", "monster_roar"}
+    assert [e["target"].endswith("_actors_hud_closed")
+            for e in _edges(r, "uses", "_ready()")] == [True]
+
+
+@_needs_gdscript
+def test_gdscript_node_path_needs_every_scene_to_agree(tmp_path):
+    root = _scene_project(tmp_path)
+    # the same script on a second scene, where `Boss` is a Hud instead of a Monster
+    (root / "scenes" / "arena_b.tscn").write_text(
+        '[gd_scene format=3]\n\n'
+        '[ext_resource type="Script" path="res://actors/arena.gd" id="1"]\n'
+        '[ext_resource type="Script" path="res://actors/hud.gd" id="2"]\n\n'
+        '[node name="Arena" type="Node2D"]\nscript = ExtResource("1")\n\n'
+        '[node name="Boss" type="Control" parent="."]\nscript = ExtResource("2")\n\n'
+        '[node name="Layer" type="CanvasLayer" parent="."]\n\n'
+        '[node name="Hud" type="Control" parent="Layer"]\nscript = ExtResource("2")\n',
+        encoding="utf-8")
+    script = root / "actors" / "arena.gd"
+    script.write_text(
+        "extends Node2D\n\n\nfunc _ready() -> void:\n"
+        "\t$Boss.hit()\n"                       # Monster in one scene, Hud in the other
+        "\t$Layer/Hud.show_x()\n", encoding="utf-8")   # a Hud in both
+    r = extract_gdscript(script)
+    assert _called(r, "_ready()") == {"hud_show_x"}
+    # a script no scene uses has no node to look a path up in
+    loose = root / "actors" / "loose.gd"
+    loose.write_text("extends Node\n\n\nfunc _ready() -> void:\n\t$Layer/Hud.show_x()\n",
+                     encoding="utf-8")
+    assert _called(extract_gdscript(loose), "_ready()") == set()
+
+
+@_needs_gdscript
+def test_gdscript_function_used_as_a_value_is_a_reference(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "timers.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\n\n\n"
+        "func go(rows: Array) -> void:\n"
+        "\tcreate_tween().tween_callback(_on_done)\n"
+        "\trows.sort_custom(_by_rank.bind(1))\n"
+        "\tvar table := {\"a\": self._on_tick, b = 1}\n"   # `b` is a key, not the function b()
+        "\tcall_deferred(\"_late\", 1)\n"
+        "\thud.call(\"show_x\")\n"
+        "\tvar late := Callable(self, \"_later\")\n"
+        "\tvar far := Callable(hud, \"get_panel\")\n\n\n"
+        "func shadowed(_on_done) -> void:\n"
+        "\trows.sort_custom(_on_done)\n"            # the parameter, not the function
+        "\thud.refresh_with(hud.show_x)\n\n\n"      # a method of another object, not ours
+        "func _on_done() -> void:\n\tpass\n\n\nfunc _by_rank(a, b, c) -> bool:\n\treturn true\n\n\n"
+        "func _on_tick() -> void:\n\tpass\n\n\nfunc _late(n: int) -> void:\n\tpass\n\n\n"
+        "func _later() -> void:\n\tpass\n\n\nfunc b() -> void:\n\tpass\n\n\n"
+        "func show_x() -> void:\n\tpass\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    referenced = {e["target"].rsplit("_actors_", 1)[-1] for e in _edges(r, "references", "go()")}
+    assert referenced == {"timers_on_done", "timers_by_rank", "timers_on_tick", "timers_later",
+                          "hud_get_panel"}
+    assert _called(r, "go()") == {"timers_late", "hud_show_x"}
+    assert _edges(r, "references", "shadowed()") == []
