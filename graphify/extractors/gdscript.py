@@ -8,7 +8,9 @@ follow how a Godot project is actually wired together:
   ``res://`` path). An engine class (``Node``, ``RefCounted``) has no script and
   yields no edge.
 * ``preload(...)`` / ``load(...)`` of a ``.gd`` -> ``imports`` to that script's
-  file node. This is how a script with no ``class_name`` is reached at all.
+  file node. This is how a script with no ``class_name`` is reached at all. A
+  preloaded ``.tscn`` / ``.tres`` -> ``imports`` to the scene / resource node
+  ``extractors/godot_resource.py`` emits for that file.
 * ``sig.connect(cb)`` / ``sig.emit(...)`` / ``emit_signal("sig", ...)`` ->
   ``uses`` from the enclosing function to the signal node; a connect also
   ``references`` its callback when that is a function of this file.
@@ -31,17 +33,21 @@ same-file resolutions.
 """
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 
+_RESOURCE_SUFFIXES = (".tscn", ".tres")
 _ENGINE_BUILTIN_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _CITATION_RE = re.compile(r"([A-Za-z0-9_./-]+\.md)`?\s*§\s*(\d+(?:\.\d+)*[a-z]?)")
 _BARE_CITATION_RE = re.compile(r"§\s*(\d+(?:\.\d+)*[a-z]?)")
 _CLASS_NAME_RE = re.compile(r"^class_name\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
-_EXTENDS_RE = re.compile(r'^extends\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))', re.M)
+_EXTENDS_RE = re.compile(      # `extends X`, or the one-line `class_name Foo extends X`
+    r'^(?:class_name\s+[A-Za-z_][A-Za-z0-9_]*\s+)?extends\s+(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_]*))',
+    re.M)
 _FUNC_RE = re.compile(r"^(?:static\s+)?func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)
 _SIGNAL_RE = re.compile(r"^signal\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)
 _AUTOLOAD_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)="\*?((?:res|uid)://[^"]+)"', re.M)
@@ -49,6 +55,40 @@ _UID_RE = re.compile(r"^(uid://[a-z0-9]+)\s*$", re.M)
 
 _PROJECT_CACHE: dict[Path, "_GodotProject | None"] = {}
 _FILE_INDEX_CACHE: dict[Path, tuple[frozenset[str], frozenset[str], str | None]] = {}
+
+
+def _resource_nid(path: Path) -> str:
+    """File node id of a scene / resource / project file (``.tscn`` / ``.tres`` /
+    ``project.godot``), as ``extractors/godot_resource.py`` mints it.
+
+    Deliberately NOT the plain file id (``_make_id(str(path))``): the pipeline
+    rewrites that to an extensionless id, and ``hud.tscn`` usually sits beside
+    ``hud.gd``. Both would claim ``hud``, the pipeline would salt the two apart
+    by path, and every ``inherits`` / ``imports`` edge aimed at the script would
+    be left dangling. Qualified like a symbol of the file, it is rewritten to a
+    root-relative id of its own (``scene/hud.tscn`` -> ``scene_hud_tscn_file``).
+    """
+    return _make_id(_file_stem(path), path.suffix.lstrip("."), "file")
+
+
+def _project_scripts(root: Path):
+    """Every ``.gd`` / ``.gd.uid`` under ``root`` that belongs to THIS project.
+
+    The engine does not look inside a directory holding ``.gdignore`` (its own
+    ``.godot`` cache, the Android build template, a staged addon update), and a
+    nested ``project.godot`` starts another project. A copy of a script left in
+    either must not claim a ``class_name`` or a ``uid://`` of the real one.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        here = Path(dirpath)
+        if here != root and (".gdignore" in filenames or "project.godot" in filenames):
+            dirnames[:] = []
+            continue
+        if ".godot" in dirnames:
+            dirnames.remove(".godot")
+        for name in filenames:
+            if name.endswith((".gd", ".gd.uid")):
+                yield here / name
 
 
 class _GodotProject:
@@ -63,25 +103,19 @@ class _GodotProject:
         self._uids: dict[str, Path] = {}
         uids = self._uids
         try:
-            for uid_file in root.rglob("*.gd.uid"):
-                if ".godot" in uid_file.parts:
-                    continue
+            for script in sorted(_project_scripts(root)):
                 try:
-                    m = _UID_RE.search(uid_file.read_text(encoding="utf-8", errors="replace"))
+                    head = script.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     continue
-                if m:
-                    uids[m.group(1)] = uid_file.with_suffix("")
-            for gd in root.rglob("*.gd"):
-                if ".godot" in gd.parts:
-                    continue
-                try:
-                    head = gd.read_text(encoding="utf-8", errors="replace")
-                except OSError:
+                if script.suffix == ".uid":
+                    m = _UID_RE.search(head)
+                    if m:
+                        uids[m.group(1)] = script.with_suffix("")
                     continue
                 m = _CLASS_NAME_RE.search(head)
                 if m and m.group(1) not in self.class_names:
-                    self.class_names[m.group(1)] = gd
+                    self.class_names[m.group(1)] = script
             text = (root / "project.godot").read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
@@ -212,13 +246,28 @@ def extract_gdscript(path: Path) -> dict:
                 "source_location": f"L{line}", "weight": 1.0}
         if context:
             edge["context"] = context
+        if tgt in foreign:
+            # transient hint the pipeline reads to rewrite an id minted from
+            # another file's absolute path into that file's canonical id — also
+            # when the file is not part of this run (an incremental update),
+            # where the edge would otherwise keep the checkout path and dangle
+            edge["target_file"] = str(foreign[tgt])
         edges.append(edge)
 
-    def other_file_nid(script: Path) -> str:
-        return _make_id(str(script))
+    foreign: dict[str, Path] = {}           # id minted for another file -> that file
+
+    def other_file_nid(target: Path) -> str:
+        if target.suffix.lower() in _RESOURCE_SUFFIXES:
+            nid = _resource_nid(target)
+        else:
+            nid = _make_id(str(target))
+        foreign[nid] = target
+        return nid
 
     def other_symbol_nid(script: Path, name: str) -> str:
-        return _make_id(_file_stem(script), name)
+        nid = _make_id(_file_stem(script), name)
+        foreign[nid] = script
+        return nid
 
     def line_of(node) -> int:
         return node.start_point[0] + 1
@@ -247,24 +296,30 @@ def extract_gdscript(path: Path) -> dict:
     func_nids: dict[str, str] = {}          # top-level func name -> nid
     signal_nids: dict[str, str] = {}        # signal name -> nid
     preload_alias: dict[str, Path] = {}     # const NAME := preload("...gd") -> script
-    function_bodies: list[tuple[str, Any, Any]] = []   # (nid, body node, def node)
+    inner_funcs: dict[str, dict[str, str]] = {}     # inner class nid -> its func name -> nid
+    function_bodies: list[tuple[str, Any, Any, str]] = []   # (nid, body node, def node, owner nid)
     top_funcs: frozenset[str] = frozenset()
 
     def declare_member(node, owner_nid: str, owner_stem: str, inner: bool) -> None:
         t = node.type
-        if t == "function_definition":
+        if t in ("function_definition", "constructor_definition"):
             name_node = node.child_by_field_name("name")
-            if not name_node:
+            if name_node:
+                name = _read_text(name_node, source)
+            elif t == "constructor_definition":
+                name = "_init"      # `func _init(...)` parses with no name field
+            else:
                 return
-            name = _read_text(name_node, source)
             nid = _make_id(owner_stem, name)
             add_node(nid, f".{name}()" if inner else f"{name}()", line_of(node), "function")
             add_edge(owner_nid, nid, "method" if inner else "contains", line_of(node))
-            if not inner:
+            if inner:
+                inner_funcs.setdefault(owner_nid, {})[name] = nid
+            else:
                 func_nids[name] = nid
             body = node.child_by_field_name("body")
             if body:
-                function_bodies.append((nid, body, node))
+                function_bodies.append((nid, body, node, owner_nid))
             return
         if t == "signal_statement":
             name_node = node.child_by_field_name("name")
@@ -290,7 +345,7 @@ def extract_gdscript(path: Path) -> dict:
             for child in node.children:
                 if child.type == "call":
                     target = _load_target(child)
-                    if target is not None:
+                    if target is not None and target.suffix == ".gd":
                         preload_alias[name] = target
             return
         if t == "enum_definition":
@@ -319,7 +374,8 @@ def extract_gdscript(path: Path) -> dict:
             return
 
     def _load_target(call_node) -> Path | None:
-        """The script a ``preload("…")`` / ``load("…")`` call names, or None."""
+        """The script, scene or resource a ``preload("…")`` / ``load("…")`` call
+        names, or None."""
         fn = None
         args = None
         for c in call_node.children:
@@ -332,7 +388,11 @@ def extract_gdscript(path: Path) -> dict:
         for a in args.children:
             value = string_value(a)
             if value is not None:
-                return _script_of(value, path, project) if value.endswith(".gd") else None
+                if value.endswith(".gd"):
+                    return _script_of(value, path, project)
+                if value.endswith(_RESOURCE_SUFFIXES) and project is not None:
+                    return project.resolve(value)
+                return None
         return None
 
     def emit_extends(node, owner_nid: str) -> None:
@@ -358,12 +418,15 @@ def extract_gdscript(path: Path) -> dict:
                 for n in nodes:
                     if n["id"] == file_nid:
                         n["label"] = class_label
+            for sub in child.children:
+                if sub.type == "extends_statement":     # `class_name Foo extends Bar`
+                    emit_extends(sub, file_nid)
         else:
             declare_member(child, file_nid, stem, False)
     top_funcs = frozenset(func_nids)
 
-    # imports: every preload/load of a .gd anywhere in the file (const aliases,
-    # locals, inline arguments) -> the target script's file node.
+    # imports: every preload/load of a .gd / .tscn / .tres anywhere in the file
+    # (const aliases, locals, inline arguments) -> the target's file node.
     def walk_loads(node) -> None:
         if node.type == "call":
             target = _load_target(node)
@@ -375,8 +438,11 @@ def extract_gdscript(path: Path) -> dict:
 
     # --- pass 2: calls and signal wiring inside function bodies -------------------
     ancestors = _ancestors(path, project)
+    scope: dict[str, str] = {}      # funcs of the inner class whose method is being walked
 
     def resolve_bare(name: str) -> str | None:
+        if name in scope:
+            return scope[name]
         if name in func_nids:
             return func_nids[name]
         for anc in ancestors:
@@ -408,13 +474,24 @@ def extract_gdscript(path: Path) -> dict:
         return other_symbol_nid(script, name) if name in signals else None
 
     def callback_of(args_node) -> str | None:
-        for a in args_node.children:
-            if a.type == "identifier":
-                return _read_text(a, source)
-            if a.type == "attribute":
-                parts = [c for c in a.children if c.type == "identifier"]
-                if len(parts) == 2 and _read_text(parts[0], source) == "self":
-                    return _read_text(parts[1], source)
+        """The function name a ``connect`` is handed as its first argument:
+        ``cb``, ``self.cb``, or either with ``.bind(...)`` / ``.unbind(n)``."""
+        a = next((c for c in args_node.children if c.is_named), None)
+        if a is None:
+            return None
+        if a.type == "identifier":
+            return _read_text(a, source)
+        if a.type == "attribute":
+            names = [_read_text(c, source) for c in a.children if c.type == "identifier"]
+            for c in a.children:
+                if c.type == "attribute_call":
+                    method = next((m for m in c.children if m.type == "identifier"), None)
+                    if method is None or _read_text(method, source) not in ("bind", "unbind"):
+                        return None
+            if names[:1] == ["self"]:
+                names = names[1:]
+            if len(names) == 1:
+                return names[0]
         return None
 
     def handle_attribute(node, caller_nid: str) -> None:
@@ -436,6 +513,14 @@ def extract_gdscript(path: Path) -> dict:
 
         # signal wiring: <signal>.connect(cb) / <signal>.emit(...)
         if method in ("connect", "emit") and names:
+            # the callback is a function of this script whoever owns the signal
+            # (`button.pressed`, `_timer.timeout`), so it is wired before the
+            # signal's own resolution can bail out
+            if method == "connect" and args is not None:
+                cb = callback_of(args)
+                cb_nid = resolve_bare(cb) if cb else None
+                if cb_nid is not None:
+                    add_edge(caller_nid, cb_nid, "references", line, context="connect")
             sig_name = names[-1]
             script = None
             if len(names) >= 2 and names[0] != "self":
@@ -448,11 +533,6 @@ def extract_gdscript(path: Path) -> dict:
             sig = signal_nid_for(script, sig_name)
             if sig is not None:
                 add_edge(caller_nid, sig, "uses", line, context=method)
-            if method == "connect" and args is not None:
-                cb = callback_of(args)
-                cb_nid = resolve_bare(cb) if cb else None
-                if cb_nid is not None:
-                    add_edge(caller_nid, cb_nid, "references", line, context="connect")
             return
 
         if head in ("self", "super") and len(names) == 1:
@@ -524,7 +604,9 @@ def extract_gdscript(path: Path) -> dict:
                     for a in c.children:
                         if a.type == "arguments":
                             walk_calls(a, caller_nid)
-                elif c.type in ("call", "attribute"):
+                else:
+                    # the receiver: a call, a nested attribute, or a subscript /
+                    # parenthesised expression that holds one (`rows[pick()].run()`)
                     walk_calls(c, caller_nid)
             return
         if t == "call":
@@ -536,11 +618,12 @@ def extract_gdscript(path: Path) -> dict:
         for c in node.children:
             walk_calls(c, caller_nid)
 
-    for nid, body, _def in function_bodies:
+    for nid, body, _def, owner in function_bodies:
+        scope = inner_funcs.get(owner, {})
         walk_calls(body, nid)
 
     # --- pass 3: documentation citations in comments -----------------------------
-    spans = [(d.start_byte, d.end_byte, nid) for nid, _b, d in function_bodies]
+    spans = [(d.start_byte, d.end_byte, nid) for nid, _b, d, _owner in function_bodies]
 
     def enclosing(byte: int) -> str:
         for start, end, nid in spans:

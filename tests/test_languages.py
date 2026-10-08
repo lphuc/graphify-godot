@@ -5627,11 +5627,13 @@ def test_gdscript_fixture_declares_every_shape(tmp_path):
     inner_methods = _edges(r, "method", "Stats")
     assert [e["target"] for e in inner_methods] == [_by_label(r, ".speed_for()")["id"]]
 
-    # imports: the two .gd preload/load targets, never the .tscn
+    # imports: the two .gd preload/load targets, and the preloaded scene under
+    # the id the scene extractor gives it
     imports = _edges(r, "imports", "PlayerController")
-    assert len(imports) == 2
-    assert {e["target"].endswith("_movement_gd") or e["target"].endswith("_inventory_gd")
+    assert len(imports) == 3
+    assert {e["target"].endswith(("_movement_gd", "_inventory_gd", "_effects_dust_puff_tscn_file"))
             for e in imports} == {True}
+    assert all(e["target_file"].endswith((".gd", ".tscn")) for e in imports)
     assert all(e["confidence"] == "EXTRACTED" for e in imports)
     # `extends CharacterBody2D` is an engine class: no inherits edge at all
     assert _edges(r, "inherits") == []
@@ -5798,3 +5800,154 @@ def test_gdscript_bare_citation_takes_the_page_named_before_it(tmp_path):
     assert "guide.md §9.9" not in by_label
     assert by_label == {"guide.md §1.1": "EXTRACTED", "guide.md §1.2": "INFERRED",
                         "guide.md §1.3": "INFERRED"}
+
+
+@_needs_gdscript
+def test_gdscript_constructor_is_a_function_and_its_body_is_walked(tmp_path):
+    root = _godot_project(tmp_path)
+    script = root / "actors" / "crate.gd"
+    script.write_text(
+        "extends RefCounted\n\n\nfunc _init(size: int = 1) -> void:\n\t_build(size)\n\n\n"
+        "func _build(size: int) -> void:\n\tpass\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    # `func _init` parses as a constructor_definition, not a function_definition
+    assert _by_label(r, "_init()")["type"] == "function"
+    assert [e["target"] for e in _edges(r, "calls", "_init()")] == [_by_label(r, "_build()")["id"]]
+
+
+@_needs_gdscript
+def test_gdscript_connect_names_its_callback_whoever_owns_the_signal(tmp_path):
+    root = _godot_project(tmp_path)
+    script = root / "actors" / "panel.gd"
+    script.write_text(
+        "extends Control\n\n\nfunc _ready() -> void:\n"
+        # signals of a child node / a local: nothing in the project index names them
+        "\tbutton.pressed.connect(_on_pressed)\n"
+        "\t_timer.timeout.connect(_on_timeout.bind(1), CONNECT_ONE_SHOT)\n"
+        "\t$Close.pressed.connect(self._on_closed.unbind(1))\n"
+        # not a function of this script: a lambda, another object's method, a returned Callable
+        "\tbutton.toggled.connect(func(on): _refresh(), CONNECT_DEFERRED)\n"
+        "\tbutton.pressed.connect(other.handler)\n"
+        "\tbutton.pressed.connect(_make_handler().bind(1))\n\n\n"
+        "func _on_pressed() -> void:\n\tpass\n\n\nfunc _on_timeout(n: int) -> void:\n\tpass\n\n\n"
+        "func _on_closed() -> void:\n\tpass\n\n\nfunc _refresh() -> void:\n\tpass\n\n\n"
+        "func handler() -> void:\n\tpass\n\n\nfunc _make_handler() -> Callable:\n\treturn handler\n",
+        encoding="utf-8")
+    r = extract_gdscript(script)
+    callbacks = {e["target"] for e in _edges(r, "references", "_ready()")
+                 if e.get("context") == "connect"}
+    assert callbacks == {_by_label(r, label)["id"]
+                         for label in ("_on_pressed()", "_on_timeout()", "_on_closed()")}
+
+
+@_needs_gdscript
+def test_gdscript_inner_class_call_binds_to_its_own_method(tmp_path):
+    root = _godot_project(tmp_path)
+    script = root / "actors" / "spawner.gd"
+    script.write_text(
+        "extends Node\n\n\nfunc build() -> void:\n\tpass\n\n\n"
+        "class Wave:\n\tfunc build() -> void:\n\t\tpass\n\n"
+        "\tfunc run() -> void:\n\t\tbuild()\n\t\tself.build()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    # the outer script has a build() too; the inner class's own one shadows it
+    assert [e["target"] for e in _edges(r, "calls", ".run()")] == [_by_label(r, ".build()")["id"]]
+
+
+@_needs_gdscript
+def test_gdscript_call_inside_a_subscripted_receiver_is_seen(tmp_path):
+    root = _godot_project(tmp_path)
+    script = root / "actors" / "queue.gd"
+    script.write_text(
+        "extends Node\n\n\nfunc run() -> void:\n\trows[_pick()].start()\n\n\n"
+        "func _pick() -> int:\n\treturn 0\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert [e["target"] for e in _edges(r, "calls", "run()")] == [_by_label(r, "_pick()")["id"]]
+
+
+@_needs_gdscript
+def test_gdscript_project_index_skips_what_the_engine_skips(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "actors" / "actor.gd").write_text("extends Node\nclass_name Actor\n", encoding="utf-8")
+    # copies of the script the engine never loads: a .gdignore'd build tree and a
+    # nested project. Both sort before actors/ and would win a first-match index.
+    for name, marker in (("aa_build", ".gdignore"), ("ab_export", "project.godot")):
+        (root / name).mkdir()
+        (root / name / marker).write_text("", encoding="utf-8")
+        (root / name / "actor.gd").write_text("extends Node\nclass_name Actor\n", encoding="utf-8")
+    enemy = root / "actors" / "enemy.gd"
+    enemy.write_text("extends Actor\n", encoding="utf-8")
+    r = extract_gdscript(enemy)
+    assert [e["target"].endswith("_actors_actor_gd")
+            for e in _edges(r, "inherits", "enemy.gd")] == [True]
+
+
+@_needs_gdscript
+def test_gdscript_cross_script_edges_survive_an_incremental_run(tmp_path):
+    from graphify.extract import extract
+    (tmp_path / "proj").mkdir()
+    root = _godot_project(tmp_path / "proj")
+    (root / "actors" / "actor.gd").write_text(
+        "extends Node\nclass_name Actor\n\nsignal died\n\n\n"
+        "func take_damage(amount: int) -> void:\n\tpass\n", encoding="utf-8")
+    grunt = root / "actors" / "grunt.gd"
+    grunt.write_text(
+        "extends Actor\n\n\nfunc _ready() -> void:\n"
+        "\ttake_damage(1)\n\tdied.emit()\n\tGameState.add_score(1)\n", encoding="utf-8")
+
+    full = extract(sorted(root.rglob("*.gd")), cache_root=tmp_path / "cache",
+                   root=root, parallel=False)
+    full_ids = {n["id"] for n in full["nodes"]}
+    assert all(e["target"] in full_ids for e in full["edges"])
+
+    # only grunt.gd re-extracted, as an update does after an edit: its edges into
+    # the scripts left out of the batch must still name those scripts' nodes
+    one = extract([grunt], cache_root=tmp_path / "cache_one", root=root, parallel=False)
+    own = {n["id"] for n in one["nodes"]}
+    cross = {(e["relation"], e["target"]) for e in one["edges"] if e["target"] not in own}
+    assert {relation for relation, _target in cross} == {"inherits", "calls", "uses"}
+    assert {target for _relation, target in cross} <= full_ids, cross
+    assert not any("target_file" in e for e in one["edges"])
+
+
+@_needs_gdscript
+def test_gdscript_one_line_class_name_extends_is_an_inherits_edge(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "actors" / "actor.gd").write_text(
+        "class_name Actor extends Node\n\n\nfunc take_damage(amount: int) -> void:\n\tpass\n",
+        encoding="utf-8")
+    (root / "actors" / "enemy.gd").write_text("class_name Enemy extends Actor\n", encoding="utf-8")
+    grunt = root / "actors" / "grunt.gd"
+    grunt.write_text("extends Enemy\n\n\nfunc _ready() -> void:\n\ttake_damage(1)\n",
+                     encoding="utf-8")
+    enemy = extract_gdscript(root / "actors" / "enemy.gd")
+    assert [e["target"].endswith("_actors_actor_gd")
+            for e in _edges(enemy, "inherits", "Enemy")] == [True]
+    # ... and the chain is followed through it: Actor is grunt's grandparent
+    calls = _edges(extract_gdscript(grunt), "calls", "_ready()")
+    assert [e["target"].endswith("_actors_actor_take_damage") for e in calls] == [True]
+
+
+@_needs_gdscript
+def test_gdscript_rerun_sees_a_function_added_to_another_script(tmp_path):
+    from graphify.extract import extract
+    (tmp_path / "proj").mkdir()
+    root = _godot_project(tmp_path / "proj")
+    actor = root / "actors" / "actor.gd"
+    actor.write_text("extends Node\nclass_name Actor\n", encoding="utf-8")
+    (root / "actors" / "grunt.gd").write_text(
+        "extends Actor\n\n\nfunc _ready() -> void:\n\ttake_damage(1)\n", encoding="utf-8")
+    paths = sorted(root.rglob("*.gd"))
+
+    def called() -> list:
+        r = extract(paths, cache_root=tmp_path / "cache", root=root, parallel=False)
+        label = {n["id"]: n["label"] for n in r["nodes"]}
+        return [label.get(e["target"]) for e in r["edges"] if e["relation"] == "calls"]
+
+    assert called() == []
+    actor.write_text(
+        "extends Node\nclass_name Actor\n\n\nfunc take_damage(amount: int) -> void:\n\tpass\n",
+        encoding="utf-8")
+    # grunt.gd did not change, but what its call resolves to did: its result must
+    # be neither replayed from the per-file cache nor resolved through the project
+    # index the first run built (one process serves many runs under watch / MCP)
+    assert called() == ["take_damage()"]

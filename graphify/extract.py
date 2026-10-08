@@ -51,7 +51,12 @@ from graphify.extractors.dm import extract_dm, extract_dmf, extract_dmi, extract
 from graphify.extractors.elixir import extract_elixir  # noqa: F401
 from graphify.extractors.erlang import extract_erlang, resolve_erlang_remote_calls  # noqa: F401
 from graphify.extractors.fortran import _cpp_preprocess, extract_fortran  # noqa: F401
-from graphify.extractors.gdscript import extract_gdscript  # noqa: F401
+from graphify.extractors.gdscript import (  # noqa: F401
+    extract_gdscript,
+    _FILE_INDEX_CACHE as _GDSCRIPT_FILE_INDEX_CACHE,
+    _PROJECT_CACHE as _GDSCRIPT_PROJECT_CACHE,
+)
+from graphify.extractors.godot_resource import extract_godot_resource  # noqa: F401
 from graphify.extractors.go import _GO_PREDECLARED_FUNCS, extract_go  # noqa: F401
 from graphify.extractors.json_config import extract_json  # noqa: F401
 from graphify.extractors.commonlisp import extract_commonlisp  # noqa: F401
@@ -7019,6 +7024,13 @@ def extract_xaml(path: Path) -> dict:
 # block defined in the corpus (count.index, each.key, self.*, path.module, ...).
 
 
+# Suffixes whose per-file result is never served from, or saved to, the AST cache.
+# JS/TS: see _JS_CACHE_BYPASS_SUFFIXES. Godot: the GDScript and scene extractors
+# resolve `extends`, calls and signal wiring against OTHER files (the project's
+# class_name / autoload index, the functions of ancestor scripts), so a result
+# keyed by the file's own content goes stale as soon as one of those files changes.
+_CACHE_BYPASS_SUFFIXES = _JS_CACHE_BYPASS_SUFFIXES | {".gd", ".tscn", ".tres", ".godot"}
+
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
     ".js": extract_js,
@@ -7062,6 +7074,9 @@ _DISPATCH: dict[str, Any] = {
     ".toc": extract_lua,
     ".zig": extract_zig,
     ".gd": extract_gdscript,
+    ".tscn": extract_godot_resource,
+    ".tres": extract_godot_resource,
+    ".godot": extract_godot_resource,
     ".ps1": extract_powershell,
     ".psm1": extract_powershell,
     ".psd1": extract_powershell_manifest,
@@ -7350,7 +7365,7 @@ def _extract_single_file(args: tuple) -> tuple[int, dict]:
     root = Path(root_str)
     cache_location = Path(cache_location_str)
     _raise_recursion_limit()
-    bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+    bypass_cache = path.suffix in _CACHE_BYPASS_SUFFIXES
 
     # Check cache first (avoid re-extraction)
     if not bypass_cache:
@@ -7579,7 +7594,7 @@ def _extract_sequential(
         if extractor is None:
             per_file[idx] = {"nodes": [], "edges": []}
             continue
-        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+        bypass_cache = path.suffix in _CACHE_BYPASS_SUFFIXES
         # XAML boundary anchors on `root` (the corpus), not the cache location.
         result = _safe_extract_with_xaml_root(extractor, path, root)
         # See _extract_single_file: don't cache an anomalous zero-node result (#1666),
@@ -7662,6 +7677,11 @@ def extract(
     _PACKAGE_IMPORTS_CACHE.clear()
     _XAML_CSHARP_CLASS_CACHE.clear()
     _MD_LINK_INDEX_CACHE.clear()
+    # The GDScript project index (class_name / autoload / uid tables, per-script
+    # func and signal names) is the same kind of state: a script edited between
+    # two runs of one process must not be resolved through the previous index.
+    _GDSCRIPT_PROJECT_CACHE.clear()
+    _GDSCRIPT_FILE_INDEX_CACHE.clear()
     _SCAN_ROOT_NAMESPACE_CACHE.clear()
     # Path-resolution memoization (#3500) is keyed by (path, cwd) with no mtime
     # component, so — like the alias caches above — a symlink repoint or a path
@@ -7732,7 +7752,7 @@ def extract(
         if _get_extractor(path) is None:
             per_file[i] = {"nodes": [], "edges": []}
             continue
-        bypass_cache = path.suffix in _JS_CACHE_BYPASS_SUFFIXES
+        bypass_cache = path.suffix in _CACHE_BYPASS_SUFFIXES
         if not bypass_cache:
             cached = load_cached(path, root, cache_root=cache_location)
             if cached is not None:
@@ -8461,6 +8481,20 @@ def extract(
             dec = _decompose(e.get("target", ""), e["target_file"])
             if dec is not None:
                 e["target"] = f"{dec[0]}_{dec[1]}"
+
+        # Any OTHER relation stamped with target_file names a symbol of that file
+        # by its absolute stem too (a GDScript call into another script's
+        # function, a scene's edge to a sub-scene). On a full run the prefix pass
+        # above already rewrote it from the target's own nodes; on an incremental
+        # run the target file is not in the batch, no node teaches the rewrite,
+        # and the checkout path would survive in the edge and leave it dangling.
+        for e in all_edges:
+            tf = e.get("target_file")
+            if (tf and e.get("relation") not in ("re_exports", "imports")
+                    and e.get("target") not in owned_ids):
+                dec = _decompose(e.get("target", ""), tf)
+                if dec is not None:
+                    e["target"] = f"{dec[0]}_{dec[1]}"
 
     # Repoint Python absolute imports onto the real file nodes under a nested
     # (src/) package root before the resolver/import-evidence passes run, so the

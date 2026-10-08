@@ -21,6 +21,7 @@ from graphify.extractors.elixir import extract_elixir
 from graphify.extractors.erlang import extract_erlang
 from graphify.extractors.fortran import extract_fortran
 from graphify.extractors.gdscript import extract_gdscript
+from graphify.extractors.godot_resource import extract_godot_resource
 from graphify.extractors.go import extract_go
 from graphify.extractors.json_config import extract_json
 from graphify.extractors.julia import extract_julia
@@ -56,6 +57,7 @@ LANGUAGE_EXTRACTORS: dict[str, Callable[[Path], dict]] = {
     "erlang": extract_erlang,
     "fortran": extract_fortran,
     "gdscript": extract_gdscript,
+    "godot_resource": extract_godot_resource,
     "go": extract_go,
     "json": extract_json,
     "julia": extract_julia,
