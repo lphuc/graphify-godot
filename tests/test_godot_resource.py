@@ -1,3 +1,5 @@
+import contextlib
+import io
 import shutil
 import tempfile
 import unittest
@@ -205,6 +207,16 @@ class TestGodotResourcePipeline(_FixtureProject):
             cross = [e["target"] for e in one["edges"] if e["target"] not in own]
             self.assertTrue(cross, rel)
             self.assertEqual([t for t in cross if t not in full_ids], [], rel)
+
+    def test_scene_is_not_reported_as_a_file_without_symbols(self):
+        # a scene or resource is one file node by design; what it holds is
+        # carried by its edges, so naming it in the "no symbols" warning is noise
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._extract()
+        self.assertNotIn(".tscn", err.getvalue())
+        # a script that declares nothing is still worth the warning
+        self.assertIn("scripts/game_state.gd", err.getvalue())
 
 
 @unittest.skipUnless(gr._load_resource_parser() is not None,

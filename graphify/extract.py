@@ -7999,6 +7999,8 @@ def extract(
     #   no-extractor files (#1689 already reports those as unsupported code);
     # - skip empty/whitespace-only files (an empty `__init__.py`, `py.typed`)
     #   — there is nothing to model, so the warning would be pure noise.
+    # - skip Godot scenes/resources: one file node is all that extractor ever
+    #   emits, the content is in the file's edges.
     # The message stays neutral ("no symbols"): a def-less script or thin
     # module is symbol-less *code*, not necessarily data.
     _symbolless_files: list[tuple[str, int]] = []
@@ -8006,7 +8008,8 @@ def extract(
         _res = per_file[i] or {}
         if _res.get("parse_errors") or _res.get("error") or _res.get("skipped"):
             continue
-        if _get_extractor(_p) is None:
+        _extractor = _get_extractor(_p)
+        if _extractor is None or _extractor is extract_godot_resource:
             continue
         if len(_res.get("nodes", [])) != 1:
             continue
