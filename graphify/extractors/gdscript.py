@@ -16,7 +16,8 @@ follow how a Godot project is actually wired together:
   ``references`` its callback when that is a function of this file.
 * a function used as a value — handed to any call (``tween_callback(_on_done)``),
   bound (``_on_done.bind(1)``), stored, or named in ``Callable(obj, "name")`` ->
-  ``references`` to that function. ``call("name")`` / ``call_deferred("name")``
+  ``references`` to that function; so is a method of a typed receiver
+  (``hud.show_x``, ``Sfx.play.bind("x")``). ``call("name")`` / ``call_deferred("name")``
   with a literal name is a ``calls`` edge like the call it stands for.
 * calls: same-file functions and functions of an ancestor script resolve
   EXTRACTED; ``Autoload.method()`` resolves through the project's
@@ -29,11 +30,15 @@ follow how a Godot project is actually wired together:
   ``as Hud``, the element of an ``Array[Hud]``, the keys and values of a
   ``Dictionary[K, V]``, and any chain of typed members and typed function
   results (``hud.panel.refresh()``, ``get_hud().show()``). A type may be an
-  inner class (``Row``, ``Grid.Cell``), and a method of an inner class is
-  walked in that class's own scope. A node path (``$Layer/Hud``, ``%Boss``,
-  ``get_node("Hud")``) is typed by the script the project's scenes put on that
-  node — reached through instanced and inherited scenes — when every scene
-  using the calling script agrees on it. Locals follow lexical scope, and an
+  inner class, nested or not (``Row``, ``Grid.Cell``, ``Deck.Hand.Card``), and a
+  method of an inner class is walked in that class's own scope. A node path
+  (``$Layer/Hud``, ``%Boss``, ``get_node("Hud")``, also through a string
+  constant) is typed by the script the project's scenes put on that node —
+  reached through instanced and inherited scenes — when every scene using the
+  calling script agrees on it; ``get_parent()``, ``owner`` and
+  ``find_child("Name")`` move through the same trees, on self or chained
+  (``owner.get_node("Boss")``), and ``get_node("/root/Name")`` is the autoload
+  of that name. Locals follow lexical scope, and an
   untyped local hides a typed member of the same name. A call resolved by none
   of those is an engine builtin or a
   dynamic dispatch and is NOT handed to the shared name-matching resolver —
@@ -72,21 +77,29 @@ _UID_RE = re.compile(r"^(uid://[a-z0-9]+)\s*$", re.M)
 
 # What a class declares about types, read by regex like the rest of the index:
 # top-level `var` lines, `func ... -> T:` signatures, preload consts, inner classes.
-_MEMBER_RE = re.compile(
-    r"^(?:@\w+(?:\([^)\n]*\))?[ \t]+)*(?:static[ \t]+)?var[ \t]+([A-Za-z_]\w*)[ \t]*([^\n]*)", re.M)
+_MEMBER_RE = re.compile(      # name, then the rest of its line — and of the next, after an open `(`
+    r"^(?:@\w+(?:\([^)\n]*\))?[ \t]+)*(?:static[ \t]+)?var[ \t]+([A-Za-z_]\w*)[ \t]*"
+    r"((?:[^\n]*\([ \t]*\n)?[^\n]*)", re.M)
 _ANNOTATION_RE = re.compile(r":[ \t]*([A-Za-z_][\w.]*(?:\[[\w., ]+\])?)")
 _NEW_RE = re.compile(r":?=[ \t]*([A-Za-z_][\w.]*)\.new\([^()\n]*\)[ \t]*(?:#.*)?$")
 _CAST_RE = re.compile(r"\bas[ \t]+([A-Za-z_][\w.]*)[ \t]*(?:#.*)?$")
 # an initialiser that is exactly one node of the scene: `$A/B`, `$"A/B"`, `%Name`,
-# `get_node("A/B")`
+# `get_node("A/B")`, optionally cast
 _NODE_REF_RE = re.compile(
-    r'=[ \t]*(?:\$"([^"\n]+)"|\$([\w/%]+)|(%\w+)|get_node(?:_or_null)?\([ \t]*\^?"([^"\n]+)"[ \t]*\))'
-    r"[ \t]*(?:#.*)?$")
-# the parameter list may span lines and hold one level of nested parentheses
-# (`at := Vector2(1, 2)`); it ends at its own `)`, so a signature with no return
-# type never borrows the `-> T` of the function after it
+    r'=[ \t]*(?:\$"([^"\n]+)"|\$([\w/%]+)|(%\w+)|get_node(?:_or_null)?\(\s*\^?"([^"\n]+)"\s*\))'
+    r"[ \t]*(?:as[ \t]+[\w.]+[ \t]*)?(?:#.*)?$")
+# a string constant: what a `get_node(SOME_PATH)` is given
+_STRING_CONST_RE = re.compile(
+    r'^const[ \t]+([A-Za-z_]\w*)[ \t]*(?::[ \t]*\w+[ \t]*)?:?=[ \t]*(?:[\^&]|NodePath\()?"([^"\n]*)"\)?'
+    r"[ \t]*(?:#.*)?$", re.M)
+# the parameter list may span lines and nest parentheses three deep
+# (`at := Vector2(maxf(1.0, absf(x)), 0.0)`); it ends at its own `)`, so a
+# signature with no return type never borrows the `-> T` of the function after it
+_PARAMETERS = r"[^()]"
+for _depth in range(3):
+    _PARAMETERS = rf"(?:[^()]|\({_PARAMETERS}*\))"
 _RETURN_RE = re.compile(
-    r"^(?:static[ \t]+)?func[ \t]+([A-Za-z_]\w*)[ \t]*\((?:[^()]|\([^()]*\))*\)[ \t]*->[ \t]*"
+    r"^(?:static[ \t]+)?func[ \t]+([A-Za-z_]\w*)[ \t]*\(" + _PARAMETERS + r"*\)[ \t]*->[ \t]*"
     r"([A-Za-z_][\w.]*(?:\[[\w., ]+\])?)[ \t]*:", re.M)
 _ALIAS_RE = re.compile(
     r"^const[ \t]+([A-Za-z_]\w*)[ \t]*(?::[ \t]*\w+[ \t]*)?:?=[ \t]*(?:preload|load)"
@@ -235,6 +248,7 @@ class _ClassIndex(NamedTuple):
     funcs: frozenset[str]
     signals: frozenset[str]
     extends: str | None
+    strings: dict[str, str]         # const -> the string it holds
 
 
 def _index_text(text: str) -> _ClassIndex:
@@ -252,13 +266,13 @@ def _index_text(text: str) -> _ClassIndex:
     return _ClassIndex(
         members, dict(_RETURN_RE.findall(text)), dict(_ALIAS_RE.findall(text)), inners,
         frozenset(_FUNC_RE.findall(text)), frozenset(_SIGNAL_RE.findall(text)),
-        (m.group(1) or m.group(2)) if m else None)
+        (m.group(1) or m.group(2)) if m else None, dict(_STRING_CONST_RE.findall(text)))
 
 
 def _type_index(script: Path, inner: str = "") -> _ClassIndex:
-    """The declarations of ``script``, or of its inner class ``inner``, by regex,
-    cached. Type names are kept as written: what they stand for depends on the
-    class that wrote them.
+    """The declarations of ``script``, or of its inner class ``inner`` (``A``, or
+    ``A/B`` for a class nested in it), by regex, cached. Type names are kept as
+    written: what they stand for depends on the class that wrote them.
 
     A member is typed by its annotation (``var hud: Hud``), or else by a
     ``:= Hud.new()`` initialiser or a trailing ``as Hud`` cast; one initialised
@@ -273,7 +287,8 @@ def _type_index(script: Path, inner: str = "") -> _ClassIndex:
     hit = _TYPE_INDEX_CACHE.get((key, inner))
     if hit is None:
         if inner:
-            text = _type_index(key).inners.get(inner, "")
+            outer, _, name = inner.rpartition("/")
+            text = _type_index(key, outer).inners.get(name, "")
         else:
             try:
                 text = key.read_text(encoding="utf-8", errors="replace")
@@ -284,17 +299,33 @@ def _type_index(script: Path, inner: str = "") -> _ClassIndex:
     return hit
 
 
+def _nested_class(script: Path, inner: str, names: list[str]) -> tuple[Path, str] | None:
+    """The class reached from ``(script, inner)`` by the inner class names
+    ``names`` in turn, or None when one of them is not declared there."""
+    for name in names:
+        if name not in _type_index(script, inner).inners:
+            return None
+        inner = f"{inner}/{name}" if inner else name
+    return (script, inner)
+
+
 def _named_class(name: str, ctx: tuple[Path, str],
                  project: "_GodotProject | None") -> tuple[Path, str] | None:
-    """The class — (script, inner class or "") — a name written inside class
-    ``ctx`` stands for: an inner class or a preload const of ``ctx``'s script or
-    of a script it extends, else a project ``class_name``; ``Outer.Inner`` names
-    an inner class of whatever ``Outer`` is. None for an engine class."""
-    script = ctx[0]
+    """The class — (script, inner class path or "") — a name written inside class
+    ``ctx`` stands for: an inner class of ``ctx`` or of a class enclosing it, an
+    inner class or a preload const of ``ctx``'s script or of a script it
+    extends, else a project ``class_name``; ``Outer.Inner`` names an inner class
+    of whatever ``Outer`` is. None for an engine class."""
+    script, scope = ctx
     if name.startswith(("res://", "uid://")) or name.endswith(".gd"):
         target = _script_of(name, script, project)
         return (target, "") if target is not None else None
-    head, _, tail = name.partition(".")
+    head, *tail = name.split(".")
+    while scope:
+        # visible from inside an inner class: what it and its enclosing classes nest
+        if head in _type_index(script, scope).inners:
+            return _nested_class(script, scope, [head, *tail])
+        scope = scope.rpartition("/")[0]
     target = None
     for holder in (script, *_ancestors(script, project)):
         index = _type_index(holder)
@@ -302,15 +333,11 @@ def _named_class(name: str, ctx: tuple[Path, str],
             target = _script_of(index.aliases[head], holder, project)
             break
         if head in index.inners:
-            return (holder, head) if not tail else None
+            return _nested_class(holder, "", [head, *tail])
     else:
         if project is not None:
             target = project.class_names.get(head)
-    if target is None:
-        return None
-    if tail:
-        return (target, tail) if tail in _type_index(target).inners else None
-    return (target, "")
+    return _nested_class(target, "", tail) if target is not None else None
 
 
 def _class_chain(cls: tuple[Path, str], project: "_GodotProject | None",
@@ -693,14 +720,26 @@ def extract_gdscript(path: Path) -> dict:
             return ("dict", (args[0], args[1]))
         return None
 
-    def node_type(ref: str | None, ctx: tuple[Path, str]) -> tuple | None:
-        """Type of the scene node a script of class ``ctx`` reaches as ``$ref``:
-        the script the scenes using ``ctx`` put on that node."""
-        if not ref or ctx[1] or project is None:
+    def node_at(anchor: Path, ref: str | None) -> tuple | None:
+        """The node the script ``anchor`` reaches as ``$ref`` — ("node", (anchor,
+        ref)), given a class only when a member of it is asked for (as_object).
+        An absolute ``/root/Name`` is the autoload of that name."""
+        if not ref or project is None:
             return None
+        if ref.startswith("/"):
+            script = project.autoloads.get(ref[len("/root/"):]) if ref.startswith("/root/") else None
+            if script is not None and script.suffix == ".gd":
+                return ("object", (script, ""))
+            return None
+        return ("node", (anchor, ref))
+
+    def as_object(of: tuple | None) -> tuple | None:
+        """A node as the class of the script the project's scenes put on it."""
+        if of is None or of[0] != "node":
+            return of
         # imported here: godot_resource builds on this module
         from graphify.extractors.godot_resource import _node_script_for
-        script = _node_script_for(ctx[0], ref, project)
+        script = _node_script_for(of[1][0], of[1][1], project)
         return ("object", (script, "")) if script is not None else None
 
     def declared_type(cls: tuple[Path, str], name: str, table: str) -> tuple | None:
@@ -714,22 +753,53 @@ def extract_gdscript(path: Path) -> dict:
         type_name, node = entry
         # `@onready var hud: Control = $Hud` — an engine annotation says nothing,
         # the node the scene puts there does
-        return named_type(type_name, holder) or node_type(node, holder)
+        return named_type(type_name, holder) or (node_at(holder[0], node) if not holder[1] else None)
+
+    def path_arg(args) -> str | None:
+        """The path a ``get_node(...)`` is given: a literal, or a string constant
+        of this class or of one it extends."""
+        first = next((a for a in args.children if a.is_named), None) if args is not None else None
+        if first is None:
+            return None
+        if first.type in ("string", "node_path"):
+            return _read_text(first, source).lstrip("^&").strip("\"'")
+        if first.type == "identifier" and _read_text(first, source) not in env:
+            return _declared(self_cls, project, "strings", _read_text(first, source))[1]
+        return None
+
+    def node_step(name: str, args) -> str | None:
+        """The step through the scene tree a navigation call takes."""
+        if name in ("get_node", "get_node_or_null"):
+            return path_arg(args)
+        if name == "get_parent":
+            return ".."
+        if name == "find_child":
+            wanted = string_arg(args, 0)
+            return f":find:{wanted}" if wanted and not set(wanted) & set("*?/") else None
+        return None
 
     def node_ref(node) -> str | None:
-        """The path a ``$A/B`` / ``%Name`` literal or ``get_node("A/B")`` call names."""
+        """The path a ``$A/B`` / ``%Name`` literal names, or the step a bare
+        ``get_node("A/B")`` / ``get_parent()`` / ``find_child("A")`` takes."""
         if node.type == "get_node":
             return _read_text(node, source).lstrip("$").strip('"')
         if node.type != "call":
             return None
         fn = next((c for c in node.children if c.type == "identifier"), None)
-        if fn is None or _read_text(fn, source) not in ("get_node", "get_node_or_null"):
+        if fn is None:
             return None
-        args = next((c for c in node.children if c.type == "arguments"), None)
-        first = next((a for a in args.children if a.is_named), None) if args is not None else None
-        if first is None or first.type not in ("string", "node_path"):
-            return None
-        return _read_text(first, source).lstrip("^").strip("\"'")
+        return node_step(_read_text(fn, source),
+                         next((c for c in node.children if c.type == "arguments"), None))
+
+    def from_node(of: tuple, step: str) -> tuple | None:
+        """The node ``step`` away from a node, or from the node an object's script runs on."""
+        if step.startswith("/"):
+            return node_at(self_script, step)
+        if of[0] == "node":
+            return node_at(of[1][0], f"{of[1][1]}/{step}")
+        if of[0] == "object" and not of[1][1]:
+            return node_at(of[1][0], step)
+        return None
 
     def expr_type(node) -> tuple | None:
         t = node.type
@@ -745,24 +815,30 @@ def extract_gdscript(path: Path) -> dict:
             holder, _ = _declared(self_cls, project, "members", name)
             if holder is not None:
                 return declared_type(self_cls, name, "members")
+            if name == "owner" and not self_cls[1]:
+                return node_at(self_script, ":owner")       # Node.owner: the scene's root
             script = resolve_receiver(name)
             return ("object", (script, "")) if script is not None else named_type(name, self_cls)
         if t == "attribute":
             return chain_type([c for c in node.children if c.is_named])
         if t == "get_node":
-            return node_type(node_ref(node), self_cls)
+            return node_at(self_script, node_ref(node)) if not self_cls[1] else None
         if t == "call":
             fn = next((c for c in node.children if c.type == "identifier"), None)
             if fn is None:
                 return None
-            return (declared_type(self_cls, _read_text(fn, source), "returns")
-                    or node_type(node_ref(node), self_cls))
+            name = _read_text(fn, source)
+            if _declared(self_cls, project, "funcs", name)[0] is not None or self_cls[1]:
+                return declared_type(self_cls, name, "returns")
+            return node_at(self_script, node_ref(node))     # get_node("A") / get_parent() on self
         if t in ("parenthesized_expression", "await_expression"):
             inner = next((c for c in node.children if c.is_named), None)
             return expr_type(inner) if inner is not None else None
         if t == "binary_operator":
             if any(c.type == "as" for c in node.children):
-                return named_type(_read_text(node.children[-1], source), self_cls)
+                cast = named_type(_read_text(node.children[-1], source), self_cls)
+                # an engine cast over a node (`$Hud as Control`) leaves the node's own type
+                return cast or (expr_type(node.children[0]) if node_ref(node.children[0]) else None)
             return None
         if t == "subscript":
             base = next((c for c in node.children if c.is_named), None)
@@ -776,22 +852,56 @@ def extract_gdscript(path: Path) -> dict:
 
     def chain_type(parts: list) -> tuple | None:
         """Type of ``head.member.method()...``: each step is looked up in the
-        class the step before it is typed as."""
+        class the step before it is typed as; a step through the scene tree
+        (``.get_node("A")``, ``.get_parent()``, ``.owner``) moves to that node."""
         current = expr_type(parts[0]) if parts else None
         for part in parts[1:]:
-            if current is None or current[0] != "object":
+            if current is None:
                 return None
             if part.type == "identifier":
-                current = declared_type(current[1], _read_text(part, source), "members")
+                name, table = _read_text(part, source), "members"
+                step = ":owner" if name == "owner" else None
             elif part.type == "attribute_call":
                 method = next((c for c in part.children if c.type == "identifier"), None)
                 if method is None:
                     return None
-                if _read_text(method, source) != "new":     # Class.new() is a Class
-                    current = declared_type(current[1], _read_text(method, source), "returns")
+                name, table = _read_text(method, source), "funcs"
+                step = node_step(name, next((c for c in part.children if c.type == "arguments"), None))
             else:
                 return None
+            if step is not None and current[0] in ("node", "object"):
+                # ... unless the class declares that very name itself
+                if current[0] == "node" or _declared(current[1], project, table, name)[0] is None:
+                    current = from_node(current, step)
+                    continue
+            current = as_object(current)
+            if current is None or current[0] != "object":
+                return None
+            if table == "members":
+                current = declared_type(current[1], name, "members")
+            elif name != "new":                             # Class.new() is a Class
+                current = declared_type(current[1], name, "returns")
         return current
+
+    def reference_method(node, caller_nid: str) -> None:
+        """``obj.method`` handed over as a Callable, also ``obj.method.bind(...)``:
+        a reference to that method of the class ``obj`` is typed as."""
+        parts = [c for c in node.children if c.is_named]
+        while parts and parts[-1].type == "attribute_call":
+            method = next((c for c in parts[-1].children if c.type == "identifier"), None)
+            if method is None or _read_text(method, source) not in ("bind", "unbind"):
+                return
+            parts.pop()
+        if len(parts) < 2 or parts[-1].type != "identifier":
+            return
+        of = as_object(chain_type(parts[:-1]))
+        if of is None or of[0] != "object":
+            return
+        name = _read_text(parts[-1], source)
+        holder, _ = _declared(of[1], project, "funcs", name)
+        if holder is not None:
+            add_edge(caller_nid, member_nid(holder, name), "references", line_of(node),
+                     context="callable")
 
     def declare(node) -> None:
         """Record the names one construct declares (a parameter list, a ``var``,
@@ -821,11 +931,12 @@ def extract_gdscript(path: Path) -> dict:
                 annotated = kind is not None and kind.type == "type"
                 declared = named_type(_read_text(kind, source), self_cls) if annotated else None
                 if declared is None and value is not None:
-                    # an engine annotation over a scripted node (`var hud: Control =
-                    # $Hud`) says less than the scene does; with no annotation the
+                    # an engine annotation over a node (`var hud: Control = $Hud`)
+                    # says less than the scene does; with no annotation the
                     # initialiser is all there is
-                    declared = (node_type(node_ref(value), self_cls) if annotated
-                                else expr_type(value))
+                    found = expr_type(value)
+                    if not annotated or node_ref(value) or (found is not None and found[0] == "node"):
+                        declared = found
                 env[_read_text(name, source)] = declared
         elif t == "for_statement":
             named = [c for c in node.children if c.is_named and c.type != "body"]
@@ -908,7 +1019,7 @@ def extract_gdscript(path: Path) -> dict:
                 owner = receiver[:-1]
                 cls = None
                 if owner and not (len(owner) == 1 and names[0] == "self"):
-                    of = chain_type(owner)
+                    of = as_object(chain_type(owner))
                     if of is None or of[0] != "object":
                         # a signal of some other object (a child node, an untyped
                         # local) — nothing in this project index names it
@@ -932,7 +1043,7 @@ def extract_gdscript(path: Path) -> dict:
                     unresolved_calls.append({"caller_nid": caller_nid, "callee": method, "line": line})
                 continue
 
-            of = chain_type(receiver)
+            of = as_object(chain_type(receiver))
             if of is not None and of[0] == "object":
                 if method == "new":
                     add_edge(caller_nid, class_nid(of[1]), "references", line, context="instantiates")
@@ -971,7 +1082,7 @@ def extract_gdscript(path: Path) -> dict:
         if fn == "Callable" and args is not None:
             # Callable(object, "method"): a reference to that object's method
             method = string_arg(args, 1)
-            of = expr_type(next(a for a in args.children if a.is_named)) if method else None
+            of = as_object(expr_type(next(a for a in args.children if a.is_named))) if method else None
             if of is not None and of[0] == "object":
                 holder, _ = _declared(of[1], project, "funcs", method)
                 if holder is not None:
@@ -996,6 +1107,7 @@ def extract_gdscript(path: Path) -> dict:
         if t == "attribute":
             handle_attribute(node, caller_nid)
             reference_callable(node, caller_nid)    # `self._on_done`, `_on_done.bind(1)`
+            reference_method(node, caller_nid)      # `hud.show_x`, `hud.show_x.bind(1)`
             for c in node.children:
                 if c.type == "attribute_call":
                     for a in c.children:

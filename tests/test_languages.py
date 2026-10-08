@@ -6316,7 +6316,7 @@ def test_gdscript_function_used_as_a_value_is_a_reference(tmp_path):
         "\tvar far := Callable(hud, \"get_panel\")\n\n\n"
         "func shadowed(_on_done) -> void:\n"
         "\trows.sort_custom(_on_done)\n"            # the parameter, not the function
-        "\thud.refresh_with(hud.show_x)\n\n\n"      # a method of another object, not ours
+        "\thud.refresh_with(hud.show_x)\n\n\n"      # the Hud's show_x, not this script's
         "func _on_done() -> void:\n\tpass\n\n\nfunc _by_rank(a, b, c) -> bool:\n\treturn true\n\n\n"
         "func _on_tick() -> void:\n\tpass\n\n\nfunc _late(n: int) -> void:\n\tpass\n\n\n"
         "func _later() -> void:\n\tpass\n\n\nfunc b() -> void:\n\tpass\n\n\n"
@@ -6326,4 +6326,118 @@ def test_gdscript_function_used_as_a_value_is_a_reference(tmp_path):
     assert referenced == {"timers_on_done", "timers_by_rank", "timers_on_tick", "timers_later",
                           "hud_get_panel"}
     assert _called(r, "go()") == {"timers_late", "hud_show_x"}
-    assert _edges(r, "references", "shadowed()") == []
+    assert {e["target"].rsplit("_actors_", 1)[-1]
+            for e in _edges(r, "references", "shadowed()")} == {"hud_show_x"}
+
+
+def _short(result: dict, relation: str, src_label: str) -> set:
+    """Targets of one function's edges as `<script>_<symbol>`, whatever folder the script is in."""
+    out = set()
+    for e in _edges(result, relation, src_label):
+        for marker in ("_actors_", "_autoload_"):
+            if marker in e["target"]:
+                out.add(e["target"].rsplit(marker, 1)[-1])
+    return out
+
+
+@_needs_gdscript
+def test_gdscript_method_of_a_typed_receiver_used_as_a_value_is_a_reference(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "wiring.gd"
+    script.write_text(
+        "extends Node\n\nvar hud: Hud\nvar boss: Monster\n\n\n"
+        "func go(tween) -> void:\n"
+        "\ttween.tween_callback(hud.show_x)\n"              # a method of a typed member
+        "\tboss.died.connect(hud.get_panel.bind(1))\n"      # ... bound
+        "\ttween.tween_callback(GameState.add_score)\n"     # ... of an autoload
+        "\ttween.tween_callback(boss.take_damage)\n"        # ... declared by the parent script
+        "\ttween.tween_property(hud.panel, \"x\", 1, 1)\n"  # a member, not a method
+        "\ttween.tween_callback(tween.kill)\n", encoding="utf-8")   # untyped receiver
+    r = extract_gdscript(script)
+    assert _short(r, "references", "go()") == {
+        "hud_show_x", "hud_get_panel", "game_state_add_score", "actor_take_damage"}
+    assert all(e["context"] == "callable" for e in _edges(r, "references", "go()"))
+
+
+@_needs_gdscript
+def test_gdscript_node_navigation_is_typed_by_the_scene(tmp_path):
+    root = _scene_project(tmp_path)
+    (root / "actors" / "arena.gd").write_text(
+        "extends Node2D\n\nconst HUD_PATH := \"Layer/Hud\"\n"
+        "@onready var close: Control = get_node_or_null(\n\t\"Popup/Close\")\n\n\n"
+        "func begin() -> void:\n"
+        "\tget_node(HUD_PATH).show_x()\n"               # the path is a constant of this script
+        "\tclose.get_panel()\n"                         # an initialiser continued on the next line
+        "\tfind_child(\"Hud\").closed.emit()\n"         # the one descendant of that name
+        "\tfind_child(\"Missing\").show_x()\n"
+        "\tget_node(\"/root/GameState\").add_score(1)\n"    # an autoload by its tree path
+        "\tvar state := get_node_or_null(\"/root/GameState\")\n"
+        "\tstate.paused.emit()\n"
+        "\t$Layer.get_node(\"Hud\").get_panel().refresh()\n", encoding="utf-8")   # navigation chained
+    (root / "actors" / "monster.gd").write_text(
+        "class_name Monster\nextends Actor\n\n\n"
+        "func hit() -> void:\n"
+        "\towner.begin()\n"                             # the root of the scene this node is in
+        "\tget_parent().get_node(\"Layer/Hud\").show_x()\n"
+        "\t$\"../Popup\".redraw()\n\n\n"
+        "func roar() -> void:\n\tpass\n", encoding="utf-8")
+    (root / "actors" / "panel.gd").write_text(
+        "class_name Panel2\nextends Control\n\n\n"
+        "func refresh() -> void:\n"
+        "\tget_parent().begin()\n"                      # above the root: the scene instancing this one
+        "\towner.get_node(\"Boss\").roar()\n\n\n"
+        "func redraw() -> void:\n\tpass\n", encoding="utf-8")
+    arena = extract_gdscript(root / "actors" / "arena.gd")
+    assert _short(arena, "calls", "begin()") == {
+        "hud_show_x", "hud_get_panel", "panel_refresh", "game_state_add_score"}
+    assert _short(arena, "uses", "begin()") == {"hud_closed", "game_state_paused"}
+    monster = extract_gdscript(root / "actors" / "monster.gd")
+    assert _short(monster, "calls", "hit()") == {"arena_begin", "hud_show_x", "panel_redraw"}
+    panel = extract_gdscript(root / "actors" / "panel.gd")
+    assert _short(panel, "calls", "refresh()") == {"arena_begin", "monster_roar"}
+    # hud.gd sits in two scenes whose roots differ: its owner is not one thing
+    hud = root / "actors" / "hud.gd"
+    hud.write_text(hud.read_text(encoding="utf-8")
+                   + "\n\nfunc ask() -> void:\n\towner.begin()\n\towner.refresh()\n", encoding="utf-8")
+    assert _short(extract_gdscript(hud), "calls", "ask()") == set()
+
+
+@_needs_gdscript
+def test_gdscript_class_nested_in_an_inner_class_is_a_type(tmp_path):
+    root = _typed_project(tmp_path)
+    script = root / "actors" / "deck.gd"
+    script.write_text(
+        "class_name Deck\nextends Node\n\n\n"
+        "class Hand:\n"
+        "\tclass Card:\n\t\tvar art: Hud\n\n\t\tfunc flip() -> void:\n\t\t\tart.show_x()\n\n"
+        "\tvar top: Card\n\n"
+        "\tfunc play() -> void:\n\t\ttop.flip()\n\t\tCard.new().flip()\n\n\n"
+        "var hand: Hand\n\n\n"
+        "func deal() -> void:\n"
+        "\thand.top.flip()\n"
+        "\tvar card: Hand.Card = null\n"
+        "\tcard.art.get_panel()\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    assert _short(r, "calls", ".flip()") == {"hud_show_x"}
+    assert _short(r, "calls", ".play()") == {"deck_hand_card_flip"}
+    assert _short(r, "calls", "deal()") == {"deck_hand_card_flip", "hud_get_panel"}
+    # the ids are the ones the declarations got
+    assert [e["target"] for e in _edges(r, "calls", ".play()")] == [_by_label(r, ".flip()")["id"]]
+    other = root / "actors" / "table.gd"
+    other.write_text("extends Node\n\n\nfunc show_card(card: Deck.Hand.Card) -> void:\n\tcard.flip()\n",
+                     encoding="utf-8")
+    assert _short(extract_gdscript(other), "calls", "show_card()") == {"deck_hand_card_flip"}
+
+
+@_needs_gdscript
+def test_gdscript_return_type_survives_nested_parentheses_in_defaults(tmp_path):
+    root = _typed_project(tmp_path)
+    (root / "actors" / "maker.gd").write_text(
+        "class_name Maker\nextends Node\n\n\n"
+        "func make(at := Vector2(maxf(1.0, absf(2.0)), 0.0), n := int(str(1))) -> Monster:\n"
+        "\treturn null\n", encoding="utf-8")
+    script = root / "actors" / "user.gd"
+    script.write_text(
+        "extends Node\n\nvar maker: Maker\n\n\nfunc run() -> void:\n\tmaker.make().roar()\n",
+        encoding="utf-8")
+    assert _short(extract_gdscript(script), "calls", "run()") == {"maker_make", "monster_roar"}

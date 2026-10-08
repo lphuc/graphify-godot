@@ -370,59 +370,73 @@ def _unique_node(scene: Path, name: str, depth: int = 0) -> str | None:
     return _unique_node(base, name, depth + 1) if base is not None else None
 
 
-def _join_node_path(scene: Path, base: str, ref: str) -> str | None:
-    """``ref`` (``A/B``, ``../C``, ``%Unique/D``) as a path from the scene root,
-    for a script sitting on node ``base`` of ``scene``."""
-    if ref.startswith("/"):
-        return None                     # absolute: outside this scene
-    parts = [] if base == "." else base.split("/")
-    segments = ref.split("/")
-    if segments[0].startswith("%"):
-        unique = _unique_node(scene, segments[0][1:])
-        if unique is None:
-            return None
-        parts = [] if unique == "." else unique.split("/")
-        segments = segments[1:]
-    for segment in segments:
-        if segment in ("", "."):
-            continue
-        if segment == "..":
-            if not parts:
-                return None             # above the scene root
-            parts.pop()
-        elif segment.startswith("%"):
-            return None
-        else:
-            parts.append(segment)
-    return "/".join(parts) or "."
-
-
-def _script_sites(project) -> dict[Path, list[tuple[Path, str]]]:
-    """Every (scene, node path) a script runs on: where the script itself is
-    attached, and where one extending it is — its ``$Path`` is looked up there too."""
-    sites = _SCRIPT_SITES_CACHE.get(project.root)
-    if sites is None:
-        sites = _SCRIPT_SITES_CACHE[project.root] = {}
+def _scene_maps(project) -> tuple[dict, dict]:
+    """Two maps of a project's scenes. ``sites``: script -> every (scene, node
+    path) it runs on — where the script itself is attached, and where one
+    extending it is. ``hosts``: scene -> every (scene, node path) that instances it."""
+    maps = _SCRIPT_SITES_CACHE.get(project.root)
+    if maps is None:
+        sites: dict[Path, list[tuple[Path, str]]] = {}
+        hosts: dict[Path, list[tuple[Path, str]]] = {}
+        heirs: dict[Path, list[Path]] = {}
         for scene in sorted(_project_files(project.root, (".tscn",))):
             tree = _scene_tree(scene)
-            for node_path, (script, _instance) in (tree.nodes.items() if tree else ()):
+            for node_path, (script, instance) in (tree.nodes.items() if tree else ()):
                 if script is not None:
                     for holder in (script, *_ancestors(script, project)):
                         sites.setdefault(holder, []).append((scene, node_path))
-    return sites
+                if instance is not None and node_path == ".":
+                    heirs.setdefault(instance, []).append(scene)    # inherits `instance`
+                elif instance is not None:
+                    hosts.setdefault(instance, []).append((scene, node_path))
+        for base, inheriting in heirs.items():
+            # a base scene's root is also the root of every scene inheriting it
+            for heir in inheriting:
+                hosts.setdefault(base, []).extend(hosts.get(heir, ()))
+        maps = _SCRIPT_SITES_CACHE[project.root] = (sites, hosts)
+    return maps
+
+
+def _node_step(project, scene: Path, path: str, segment: str) -> set[tuple[Path, str]] | None:
+    """The (scene, node path) places one path segment leads to from a node:
+    a child name, ``..``, ``%Unique``, ``:owner`` (the node's owner) or
+    ``:find:Name`` (its one descendant of that name). None when it leads nowhere known."""
+    if segment in ("", "."):
+        return {(scene, path)}
+    if segment in ("..", ":owner"):
+        if path != ".":
+            return {(scene, "." if segment == ":owner" else path.rpartition("/")[0] or ".")}
+        # above a scene's root: wherever that scene is instanced
+        return {(host, "." if segment == ":owner" else at.rpartition("/")[0] or ".")
+                for host, at in _scene_maps(project)[1].get(scene, ())} or None
+    if segment.startswith("%"):
+        unique = _unique_node(scene, segment[1:])
+        return {(scene, unique)} if unique is not None else None
+    if segment.startswith(":find:"):
+        tree = _scene_tree(scene)
+        under = "" if path == "." else path + "/"
+        named = [p for p in (tree.nodes if tree else ())
+                 if p != "." and p.startswith(under) and p.rpartition("/")[2] == segment[6:]]
+        return {(scene, named[0])} if len(named) == 1 else None
+    return {(scene, segment if path == "." else f"{path}/{segment}")}
 
 
 def _node_script_for(script: Path, ref: str, project) -> Path | None:
-    """The script on the node that ``script`` reaches as ``$ref``. Known only
-    when every scene using ``script`` puts the same script there; a script no
-    scene uses has no node to look the path up in."""
-    found: set[Path | None] = set()
-    for scene, node_path in _script_sites(project).get(script, ()):
-        target = _join_node_path(scene, node_path, ref)
-        found.add(_node_script(scene, target) if target is not None else None)
-        if len(found) > 1:
-            return None
-    return next(iter(found)) if found else None
+    """The script on the node that ``script`` reaches as ``$ref`` (``A/B``,
+    ``../C``, ``%Unique/D``, and the ``:owner`` / ``:find:Name`` steps). Known
+    only when every scene using ``script`` puts the same script there; a script
+    no scene uses has no node to look the path up from."""
+    places = set(_scene_maps(project)[0].get(script, ()))
+    for segment in ref.split("/"):
+        stepped: set[tuple[Path, str]] = set()
+        for scene, path in places:
+            reached = _node_step(project, scene, path, segment)
+            if reached is None:
+                return None
+            stepped |= reached
+        places = stepped
+    found = {_node_script(scene, path) for scene, path in places}
+    return next(iter(found)) if len(found) == 1 else None
 
 
 # ---------------------------------------------------------------------------
