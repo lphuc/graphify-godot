@@ -2,6 +2,25 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/Graphify-Labs/graphify/releases)
 
+## 0.9.81 (2026-10-08)
+
+A large resolution-accuracy and determinism batch across Python, TypeScript, C#, Elixir, and PHP, plus analysis-quality fixes and a portability regression guard.
+
+- Fix: **Python** nested class identities are now qualified by their enclosing class, so `class Outer: class Inner` no longer collides with a different `Outer2: Inner` into one node (and their methods no longer collapse together) (#4228, thanks @xiehuanyi).
+- Feature: **Python** `self`/`cls`/`super()` calls now resolve to a base-class method defined in another file, fail-closed on multiple/opaque/out-of-corpus bases, with `super(Cls, obj)` forms excluded (#4222, #4221, thanks @rohit-jsfreaky).
+- Fix: **Python** typed-receiver resolution finds a nested function's file by climbing to the real file node, so a `self.x.m()`/annotated-local call inside a nested def now resolves instead of failing the visibility check (#4227, #4226, thanks @rohit-jsfreaky).
+- Fix: **Python** an absolute import (`from werkzeug.wrappers import Request`) no longer resolves onto a local same-named module (`wrappers.py`), which had rewired a class to inherit from itself; a same-named module in another package still resolves (#4225, #4224, thanks @rohit-jsfreaky).
+- Feature: **TypeScript** `this.field` receivers are typed from class field declarations (not only constructor-injected parameters), so a service's `this.repo.find()` resolves; fail-closed on static/array/union/generic field types (#4231, #4230, thanks @rohit-jsfreaky).
+- Fix: **TypeScript** a call on a receiver whose type name is declared in several files resolves to the one the caller actually imports, and a public call never binds to a `#private` method of the same name (#4233, #4232, thanks @rohit-jsfreaky).
+- Fix: **C#** types declared in an enclosing namespace now resolve from a nested namespace (`Demo.Inner` referencing a type in `Demo`), innermost-wins, additive over the existing scope resolution (#4204, #4196, thanks @hopstreax).
+- Fix: **Elixir** qualified and aliased remote calls (`App.Accounts.get_user`, `alias App.Accounts; Accounts.get_user`) resolve to the right module's function, and a member call never mis-binds to a same-named local; cross-file targets link only to the single corpus module that defines the function (#4213, #4206, thanks @Mpasha17).
+- Fix: **Elixir** keyword-form definition bodies (`def f(x), do: g(x)`) now have their calls extracted, not only the `do`/`end` block form (#4210, #4207, thanks @rtmalikian).
+- Fix: **PHP** 8.5 `(void)` casts and a cast applied to a `match` expression are parsed via a fail-safe pre-processing pass, so calls behind them are no longer dropped to a syntax error (#4211, #4202, thanks @Mpasha17).
+- Fix: plain AST declarations (TS type aliases, enum members, JSON keys) whose only edge is the structural `contains` from their file are no longer flagged as weakly-connected knowledge gaps in the analysis output and GRAPH_REPORT.md (#4212, #4205, thanks @nothariharan).
+- Fix: low-confidence AMBIGUOUS edges are scaled down before community detection (on a copy, leaving the real graph untouched) so they no longer fuse independent clusters, and ambiguous suggested questions move to a separate low-confidence section; `GRAPHIFY_AMBIGUOUS_SCALE=1.0` restores the prior behavior (#4214, #4199, thanks @JunoLee1).
+- Test: a portability regression guard pins that the same repo graphs identically regardless of checkout folder, warm vs cold rebuild, or line endings, and that no checkout path leaks into graph.json (#4218, #4217, thanks @rohit-jsfreaky).
+- Docs: `graphify path`'s top-level help now states it defaults to a directed search and does not consult the JSON `directed` flag (#4229, #3712, thanks @wanjinhao1); CONTRIBUTING.md adds guidance for contributors using AI coding agents (#4219, thanks @adityatiwari101104).
+
 ## 0.9.80 (2026-10-07)
 
 More clone-identical determinism, a large MCP retrieval speedup, and a batch of extractor and resolution fixes.

@@ -1829,7 +1829,7 @@ def _extract_python_rationale(path: Path, result: dict) -> None:
             body = node.child_by_field_name("body")
             if name_node and body:
                 class_name = source[name_node.start_byte:name_node.end_byte].decode("utf-8", errors="replace")
-                nid = _make_id(stem, class_name)
+                nid = _make_id(parent_nid, class_name) if parent_nid != file_nid else _make_id(stem, class_name)
                 ds = _get_docstring(body)
                 if ds:
                     _add_rationale(ds[0], ds[1], nid)
@@ -3170,6 +3170,37 @@ def _php_mask_to_script_blocks(src: str) -> tuple[str, bool]:
     return "".join(out), True
 
 
+# tree-sitter-php (the pinned <0.25 and 0.25.1 alike) has no PHP 8.5 `(void)`
+# cast and cannot parse a cast applied directly to `match (...)`: the statement
+# becomes an ERROR node, can lose its call, and the file is reported as partially
+# extracted (#4202). Blanking just the cast keeps the call or match after it.
+_PHP_UNPARSED_CAST_RE = re.compile(
+    rb"\(\s*void\s*\)|\(\s*(?:string|int|integer|float|double|real|bool|boolean"
+    rb"|array|object|binary)\s*\)(?=\s*match\s*\()",
+    re.IGNORECASE,
+)
+_PHP_NON_CODE = frozenset({"comment", "string", "encapsed_string", "heredoc", "nowdoc", "text"})
+
+
+def _php_blank_unparsed_casts(source: bytes) -> bytes:
+    """Blank `(void)` casts and casts on `match` to spaces, outside strings and
+    comments, keeping every byte offset and line number (#4202)."""
+    matches = list(_PHP_UNPARSED_CAST_RE.finditer(source))
+    if not matches:
+        return source
+    import tree_sitter_php
+    from tree_sitter import Language, Parser
+    root = Parser(Language(tree_sitter_php.language_php())).parse(source).root_node
+    out = bytearray(source)
+    for m in matches:
+        node = root.descendant_for_byte_range(m.start(), m.start() + 1)
+        while node is not None and node.type not in _PHP_NON_CODE:
+            node = node.parent
+        if node is None:
+            out[m.start():m.end()] = re.sub(rb"[^\r\n]", b" ", m.group())
+    return bytes(out)
+
+
 def extract_php(path: Path) -> dict:
     """Extract classes, functions, methods, namespace uses, and calls from a .php file.
 
@@ -3184,7 +3215,11 @@ def extract_php(path: Path) -> dict:
     dropped JS node would have used, so no edge from the discarded symbol
     is left to silently attach to the unrelated PHP node sharing its id.
     """
-    result = _extract_generic(path, _PHP_CONFIG)
+    try:
+        source = _php_blank_unparsed_casts(_read_source_bytes(path))
+    except Exception:
+        source = None  # let _extract_generic read the file and report errors
+    result = _extract_generic(path, _PHP_CONFIG, source_override=source)
     try:
         src = _read_source_text(path, warn=False)
         masked, had_script = _php_mask_to_script_blocks(src)
@@ -4257,12 +4292,17 @@ def _resolve_python_member_calls(
             method_class[tgt] = src
 
     def _file_node(nid: str) -> "str | None":
+        # Climb `contains` / `method` parents to the top, which is the file: a
+        # nested function's `contains` parent is its enclosing function, not the
+        # file, so stopping at the first parent compared a function to a file.
         seen: set[str] = set()
+        parent: "str | None" = None
         while nid and nid not in seen:
             seen.add(nid)
-            if nid in file_of_node:
-                return file_of_node[nid]
-            nid = method_class.get(nid, "")
+            up = file_of_node.get(nid) or method_class.get(nid)
+            if not up:
+                return parent
+            parent = nid = up
         return None
 
     def _emit_call(
@@ -4289,6 +4329,58 @@ def _resolve_python_member_calls(
             "weight": 1.0,
         })
 
+    # A changed-files rebuild resolves only its own batch, so a base class that lives
+    # in an unchanged file is still a name stub here, while a full build has already
+    # rewired it to the unique definition. Run that same rewire on COPIES of the
+    # inherits edges so both builds walk the same chain; the real edges are untouched.
+    inherits_edges = [dict(e) for e in all_edges if e.get("relation") == "inherits"]
+    if any(not node_by_id.get(str(e.get("target")), {}).get("source_file") for e in inherits_edges):
+        _rewire_unique_stub_nodes(list(all_nodes), inherits_edges)
+    bases_of: dict[str, list[str]] = {}
+    for e in inherits_edges:
+        src, tgt = e.get("source"), e.get("target")
+        if isinstance(src, str) and isinstance(tgt, str):
+            bases_of.setdefault(src, [])
+            if tgt not in bases_of[src]:
+                bases_of[src].append(tgt)
+
+    def _inherited_method(caller: str, callee: str, skip_own: bool) -> "str | None":
+        # `self.m()` / `cls.m()` / `super().m()` whose `m` lives on a base class in
+        # another file: the in-file pass only walks bases declared in the same file.
+        # Walk a single-inheritance chain only; stop (no edge) at a class with two
+        # or more bases (MRO order across files is not modelled), a base the edge
+        # list cannot show, or a base outside the corpus. The caller's own base must
+        # also be defined in or imported by the caller's file. Further hops trust the
+        # `inherits` edges: a changed-files rebuild carries an unchanged class's
+        # inherits edges but not its imports, and both builds must walk alike.
+        # The first class owning `m` wins, as in the MRO.
+        cls = method_class.get(caller)
+        seen: set[str] = set()
+        first_hop = True
+        while cls and cls not in seen:
+            seen.add(cls)
+            if not skip_own:
+                hit = method_index.get((cls, _key(callee)))
+                if hit:
+                    return hit
+            skip_own = False
+            if (node_by_id.get(cls, {}).get("metadata") or {}).get("python_opaque_bases"):
+                return None
+            bases = bases_of.get(cls, [])
+            if len(bases) != 1 or bases[0] == cls:
+                return None
+            base = bases[0]
+            cls_file, base_file = _file_node(cls), _file_node(base)
+            if cls_file is None or base_file is None or not node_by_id.get(base, {}).get("source_file"):
+                return None
+            if first_hop:
+                imported = imported_by_filenode.get(cls_file, set())
+                if not (base_file == cls_file or base in imported or base_file in imported):
+                    return None
+            first_hop = False
+            cls = base
+        return None
+
     for rc in all_raw_calls:
         if rc.get("_ambiguous_python_import"):
             continue
@@ -4297,6 +4389,12 @@ def _resolve_python_member_calls(
         receiver = rc.get("receiver")
         callee = rc.get("callee")
         caller = rc.get("caller_nid")
+        if receiver in ("self", "cls", "super") and callee and caller and not rc.get("_python_super_args"):
+            target = _inherited_method(caller, callee, skip_own=receiver == "super")
+            if target:
+                # Same rule as the in-file base walk (_self_call_target), across files.
+                _emit_call(caller, target, rc)
+                continue
         attr_type = rc.get("_python_self_attr_type")
         if attr_type and callee and caller:
             # `self.X.m()` with X bound to one class (#2860): only a unique class
@@ -4476,27 +4574,40 @@ def _resolve_typescript_member_calls(
         if type_name in _LANGUAGE_BUILTIN_GLOBALS:
             continue
         type_defs = type_def_nids.get(_key(type_name), [])
-        if len(type_defs) != 1:
-            continue
-        type_nid = type_defs[0]
         # Origin gate (#2553): the caller's file must actually see the matched
         # type — same file, a named import of the type, or a module import of
         # the type's file. Otherwise a third-party type name that happens to
         # collide with a local class fabricates an edge; emit nothing.
+        # The same gate also picks among same-named definitions: `Context` can be
+        # a class in one file and an interface in two others, and the caller's
+        # import says which one its `c: Context` means. Exactly one visible
+        # definition is required; none or several still emit nothing.
         caller_file = file_of_node.get(caller)
-        type_file = file_of_node.get(type_nid)
         imported = imported_by_filenode.get(caller_file, set())
-        if not (
-            (caller_file is not None and caller_file == type_file)
-            or type_nid in imported
-            or (type_file is not None and type_file in imported)
-        ):
+
+        def _visible(nid: str) -> bool:
+            type_file = file_of_node.get(nid)
+            return (
+                (caller_file is not None and caller_file == type_file)
+                or nid in imported
+                or (type_file is not None and type_file in imported)
+            )
+
+        visible = [nid for nid in type_defs if _visible(nid)]
+        if len(visible) != 1:
             continue
+        type_nid = visible[0]
         method_nid = method_index.get((type_nid, _key(callee)))
         if not method_nid:
             # Receiver typed, but the type has no such method. The old fallback
             # (a `references` edge to the type node) was another fabrication
             # vector; skip instead, matching the C# resolver.
+            continue
+        # _key() drops the `#`, so `c.newResponse()` also keys onto a private
+        # `#newResponse()`. A `#name` is only reachable as `#name`; never bind
+        # across that difference.
+        method_name = str(node_by_id.get(method_nid, {}).get("label", "")).lstrip(".")
+        if method_name.startswith("#") != str(callee).startswith("#"):
             continue
         if method_nid == caller or (caller, method_nid) in existing_pairs:
             continue
@@ -5784,6 +5895,73 @@ def _resolve_elixir_import_targets(
         e["target"] = target_nid
 
 
+def _resolve_elixir_qualified_calls(
+    per_file: list[dict],
+    all_nodes: list[dict],
+    all_edges: list[dict],
+) -> None:
+    """Resolve Elixir remote calls that name their module (#4206).
+
+    extract_elixir expands the receiver of `App.Accounts.get_user(id)` /
+    `Accounts.get_user(id)` (through the caller's `alias` table and
+    `__MODULE__`) and stamps it on the raw_call as ``elixir_module``; calls
+    into a module of the same file are linked there already. The shared pass
+    skips member calls, so this pass is strictly additive, like
+    `_resolve_csharp_qualified_calls`.
+
+    The module must match exactly one top-level module in the corpus and the
+    function must be one of its own defs. A module outside the corpus (Ecto's
+    `Repo`, `Enum`, `Map`) gets no edge rather than a same-named guess.
+    """
+    raw = [
+        rc
+        for result in per_file
+        for rc in result.get("raw_calls", [])
+        if rc.get("elixir_module") and rc.get("callee") and rc.get("caller_nid")
+    ]
+    if not raw:
+        return
+
+    module_nids: dict[str, list[str]] = {}
+    labels: dict[str, str] = {}
+    for n in all_nodes:
+        labels[n["id"]] = str(n.get("label") or "")
+        if n.get("_elixir_module") and n.get("source_file"):
+            module_nids.setdefault(labels[n["id"]], []).append(n["id"])
+    defs: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") == "method":
+            name = labels.get(e.get("target", ""), "")
+            if name.endswith("()"):
+                defs.setdefault((e["source"], name[:-2]), e["target"])
+
+    existing_pairs = {
+        (e.get("source"), e.get("target"))
+        for e in all_edges
+        if e.get("relation") == "calls"
+    }
+    for rc in raw:
+        candidates = module_nids.get(rc["elixir_module"], [])
+        if len(candidates) != 1:
+            continue
+        caller = rc["caller_nid"]
+        tgt = defs.get((candidates[0], rc["callee"]))
+        if tgt is None or tgt == caller or (caller, tgt) in existing_pairs:
+            continue
+        existing_pairs.add((caller, tgt))
+        all_edges.append({
+            "source": caller,
+            "target": tgt,
+            "relation": "calls",
+            "context": "call",
+            "confidence": "EXTRACTED",  # the module is written in source
+            "confidence_score": 1.0,
+            "source_file": rc.get("source_file", ""),
+            "source_location": rc.get("source_location"),
+            "weight": 1.0,
+        })
+
+
 def _resolve_kotlin_member_calls(
     per_file: list[dict],
     all_nodes: list[dict],
@@ -5952,6 +6130,13 @@ register_language_resolver(
         "elixir_import_targets",
         frozenset({".ex", ".exs"}),
         _resolve_elixir_import_targets,
+    )
+)
+register_language_resolver(
+    LanguageResolver(
+        "elixir_qualified_calls",
+        frozenset({".ex", ".exs"}),
+        _resolve_elixir_qualified_calls,
     )
 )
 # Pascal/Delphi cross-file inherited-method-call resolution: a call from a
