@@ -7,10 +7,14 @@ follow how a Godot project is actually wired together:
 * ``extends`` -> ``inherits`` to the parent SCRIPT (a ``class_name`` or a
   ``res://`` path). An engine class (``Node``, ``RefCounted``) has no script and
   yields no edge.
-* ``preload(...)`` / ``load(...)`` of a ``.gd`` -> ``imports`` to that script's
-  file node. This is how a script with no ``class_name`` is reached at all. A
-  preloaded ``.tscn`` / ``.tres`` -> ``imports`` to the scene / resource node
-  ``extractors/godot_resource.py`` emits for that file.
+* ``preload(...)`` / ``load(...)`` / ``ResourceLoader.load(...)`` of a ``.gd`` ->
+  ``imports`` to that script's file node. This is how a script with no
+  ``class_name`` is reached at all. A preloaded ``.tscn`` / ``.tres`` ->
+  ``imports`` to the scene / resource node ``extractors/godot_resource.py``
+  emits for that file, a ``.gdshader`` to the one ``extractors/gdshader.py``
+  does. A ``const`` / ``var`` member holding the ``res://`` path of any of
+  those is the same edge (``context`` "path"): the path is the dependency,
+  whoever ends up loading it.
 * ``sig.connect(cb)`` / ``sig.emit(...)`` / ``emit_signal("sig", ...)`` ->
   ``uses`` from the enclosing function to the signal node; a connect also
   ``references`` its callback when that is a function of this file.
@@ -69,7 +73,11 @@ from typing import Any, NamedTuple
 
 from graphify.extractors.base import _file_stem, _make_id, _read_text
 
-_RESOURCE_SUFFIXES = (".tscn", ".tres")
+_SHADER_SUFFIXES = (".gdshader", ".gdshaderinc")
+# files whose node is minted by _resource_nid, not by their bare path
+_RESOURCE_SUFFIXES = (".tscn", ".tres", *_SHADER_SUFFIXES)
+# ResourceLoader methods whose first argument is the path of what they load
+_RESOURCE_LOADER_LOADS = ("load", "load_threaded_request", "load_threaded_get")
 _ENGINE_BUILTIN_RE = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 _CITATION_RE = re.compile(r"([A-Za-z0-9_./-]+\.md)`?\s*§\s*(\d+(?:\.\d+)*[a-z]?)")
 _BARE_CITATION_RE = re.compile(r"§\s*(\d+(?:\.\d+)*[a-z]?)")
@@ -137,7 +145,8 @@ _TYPE_INDEX_CACHE: dict[tuple[Path, str], "_ClassIndex"] = {}
 
 def _resource_nid(path: Path) -> str:
     """File node id of a scene / resource / project file (``.tscn`` / ``.tres`` /
-    ``project.godot``), as ``extractors/godot_resource.py`` mints it.
+    ``project.godot``), as ``extractors/godot_resource.py`` mints it, and of a
+    shader, as ``extractors/gdshader.py`` does.
 
     Deliberately NOT the plain file id (``_make_id(str(path))``): the pipeline
     rewrites that to an extensionless id, and ``hud.tscn`` usually sits beside
@@ -581,6 +590,10 @@ def extract_gdscript(path: Path) -> dict:
                     target = _load_target(child)
                     if target is not None and target.suffix == ".gd":
                         preload_alias[name] = target
+            import_path(node)
+            return
+        if t == "variable_statement":
+            import_path(node)
             return
         if t == "enum_definition":
             name_node = node.child_by_field_name("name")
@@ -609,9 +622,17 @@ def extract_gdscript(path: Path) -> dict:
                         declare_member(member, nid, f"{owner_stem}/{name}", True)
             return
 
-    def _load_target(call_node) -> Path | None:
-        """The script, scene or resource a ``preload("…")`` / ``load("…")`` call
-        names, or None."""
+    def _path_target(value: str) -> Path | None:
+        """The script, scene, resource or shader a path literal names, or None."""
+        if value.endswith(".gd"):
+            return _script_of(value, path, project)
+        if value.endswith(_RESOURCE_SUFFIXES) and project is not None:
+            return project.resolve(value)
+        return None
+
+    def _load_target(call_node, loaders: tuple[str, ...] = ("preload", "load")) -> Path | None:
+        """The script, scene, resource or shader a ``preload("…")`` / ``load("…")``
+        call names, or None."""
         fn = None
         args = None
         for c in call_node.children:
@@ -619,17 +640,23 @@ def extract_gdscript(path: Path) -> dict:
                 fn = _read_text(c, source)
             elif c.type == "arguments":
                 args = c
-        if fn not in ("preload", "load") or args is None:
+        if fn not in loaders or args is None:
             return None
         for a in args.children:
             value = string_value(a)
             if value is not None:
-                if value.endswith(".gd"):
-                    return _script_of(value, path, project)
-                if value.endswith(_RESOURCE_SUFFIXES) and project is not None:
-                    return project.resolve(value)
-                return None
+                return _path_target(value)
         return None
+
+    def import_path(node) -> None:
+        """``const HUD_PATH := "res://ui/hud.tscn"``: a member holding the path of
+        a script, scene, resource or shader depends on that file, whoever loads it."""
+        value_node = node.child_by_field_name("value")
+        value = string_value(value_node) if value_node is not None else None
+        if value is not None and value.startswith("res://"):
+            target = _path_target(value)
+            if target is not None:
+                add_edge(file_nid, other_file_nid(target), "imports", line_of(node), context="path")
 
     def emit_extends(node, owner_nid: str) -> None:
         spec = None
@@ -661,13 +688,20 @@ def extract_gdscript(path: Path) -> dict:
             declare_member(child, file_nid, stem, False)
     top_funcs = frozenset(func_nids)
 
-    # imports: every preload/load of a .gd / .tscn / .tres anywhere in the file
-    # (const aliases, locals, inline arguments) -> the target's file node.
+    # imports: every preload/load of a .gd / .tscn / .tres / shader anywhere in the
+    # file (const aliases, locals, inline arguments) -> the target's file node.
     def walk_loads(node) -> None:
+        target = None
         if node.type == "call":
             target = _load_target(node)
-            if target is not None:
-                add_edge(file_nid, other_file_nid(target), "imports", line_of(node))
+        elif node.type == "attribute":
+            # ResourceLoader.load("…"): the same load, asked of the singleton
+            parts = [c for c in node.children if c.is_named]
+            if (len(parts) > 1 and parts[1].type == "attribute_call"
+                    and _read_text(parts[0], source) == "ResourceLoader"):
+                target = _load_target(parts[1], _RESOURCE_LOADER_LOADS)
+        if target is not None:
+            add_edge(file_nid, other_file_nid(target), "imports", line_of(node))
         for c in node.children:
             walk_loads(c)
     walk_loads(root)

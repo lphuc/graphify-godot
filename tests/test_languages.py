@@ -6573,3 +6573,67 @@ def test_gdscript_member_typed_by_what_is_assigned_to_it(tmp_path):
         "\tonly.hit()\n\tswapped.show_x()\n\tmixed.hit()\n", encoding="utf-8")
     r = extract_gdscript(script)
     assert _confidence(r, "calls", "use()") == {"monster_hit": "EXTRACTED", "hud_show_x": "INFERRED"}
+
+
+@_needs_gdscript
+def test_gdscript_resource_loader_load_is_an_import(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "ui").mkdir()
+    (root / "ui" / "hud.tscn").write_text("[gd_scene format=3]\n", encoding="utf-8")
+    script = root / "actors" / "test_movement.gd"
+    script.write_text(
+        "extends Node\n\n\nfunc test_it() -> void:\n"
+        '\tvar fresh = ResourceLoader.load("res://actors/movement.gd", "", ResourceLoader.CACHE_MODE_IGNORE)\n'
+        '\tResourceLoader.load_threaded_request("res://ui/hud.tscn")\n'
+        # asking whether a file exists loads nothing, and only ResourceLoader's
+        # `load` takes a resource path: a ConfigFile's does not
+        '\tif ResourceLoader.exists("res://actors/inventory.gd"):\n\t\tpass\n'
+        '\tvar cfg := ConfigFile.new()\n\tcfg.load("res://autoload/game_state.gd")\n',
+        encoding="utf-8")
+    r = extract_gdscript(script)
+    from graphify.extract import _make_id
+    from graphify.extractors.gdscript import _resource_nid
+    assert {(e["target"], e["source_location"]) for e in _edges(r, "imports")} == {
+        (_make_id(str(root / "actors" / "movement.gd")), "L5"),
+        (_resource_nid(root / "ui" / "hud.tscn"), "L6"),
+    }
+
+
+@_needs_gdscript
+def test_gdscript_path_constant_is_an_import(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "ui").mkdir()
+    (root / "ui" / "hud.tscn").write_text("[gd_scene format=3]\n", encoding="utf-8")
+    (root / "ui" / "theme.tres").write_text("[gd_resource format=3]\n", encoding="utf-8")
+    script = root / "actors" / "loader.gd"
+    script.write_text(
+        "extends Node\n\n"
+        'const HUD_PATH := "res://ui/hud.tscn"\n'
+        'const MOVEMENT_PATH: String = "res://actors/movement.gd"\n'
+        '@export var theme_path := "res://ui/theme.tres"\n'
+        # not a script, scene, resource or shader: no node to aim at
+        'const ICON := "res://icon.png"\nconst UI_DIR := "res://ui/"\nconst NAME := "hud.tscn"\n\n\n'
+        "func show() -> void:\n\tvar hud = load(HUD_PATH)\n", encoding="utf-8")
+    r = extract_gdscript(script)
+    from graphify.extract import _make_id
+    from graphify.extractors.gdscript import _resource_nid
+    imports = _edges(r, "imports", "loader.gd")
+    assert {(e["target"], e["source_location"]) for e in imports} == {
+        (_resource_nid(root / "ui" / "hud.tscn"), "L3"),
+        (_make_id(str(root / "actors" / "movement.gd")), "L4"),
+        (_resource_nid(root / "ui" / "theme.tres"), "L5"),
+    }
+    assert {e.get("context") for e in imports} == {"path"}
+
+
+@_needs_gdscript
+def test_gdscript_preloaded_shader_is_an_import(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "fx").mkdir()
+    (root / "fx" / "shine.gdshader").write_text("shader_type canvas_item;\n", encoding="utf-8")
+    script = root / "actors" / "card.gd"
+    script.write_text(
+        'extends Node\n\nconst SHINE := preload("res://fx/shine.gdshader")\n', encoding="utf-8")
+    r = extract_gdscript(script)
+    from graphify.extractors.gdscript import _resource_nid
+    assert [e["target"] for e in _edges(r, "imports")] == [_resource_nid(root / "fx" / "shine.gdshader")]

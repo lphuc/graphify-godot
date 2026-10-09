@@ -8,6 +8,8 @@ and ``project.godot`` and emits Graphify's node/edge dicts:
       (its ``context`` is the scene-tree path of the node carrying the script)
     - ``[ext_resource type="PackedScene" path="res://y.tscn"]`` -> ``instances`` edge
     - ``[ext_resource ... path="res://z.tres"]`` -> ``uses_resource`` edge
+    - ``[ext_resource type="Shader" path="res://w.gdshader"]`` -> ``uses_resource``
+      edge to the shader node ``extractors/gdshader.py`` emits
     - ``[connection signal="s" from="A" to="B" method="m"]`` -> ``connects`` edge to
       the function ``m`` of B's script, or of the ancestor script that declares it
 
@@ -19,8 +21,7 @@ and ``project.godot`` and emits Graphify's node/edge dicts:
 Every cross-file edge targets the id the other file's own extractor mints and
 carries no stub node: a stub would be owned by the referencing file, so the
 pipeline would keep it apart from the real node and the edge would never reach
-it. Plain assets (textures, audio, fonts, shaders) have no extractor and yield
-no edge.
+it. Plain assets (textures, audio, fonts) have no extractor and yield no edge.
 
 Godot's scene / resource / project files all share one text format. When the
 ``godot_resource`` tree-sitter grammar is available (bundled in
@@ -40,7 +41,8 @@ from pathlib import Path
 
 from graphify.extractors.base import _file_stem, _make_id
 from graphify.extractors.gdscript import (
-    _RESOURCE_SUFFIXES, _ancestors, _file_index, _project_files, _project_for, _resource_nid,
+    _RESOURCE_SUFFIXES, _SHADER_SUFFIXES, _ancestors, _file_index, _project_files, _project_for,
+    _resource_nid,
 )
 
 # greedy up to the LAST ``]`` of the line, so a ``]`` inside a quoted value
@@ -567,7 +569,7 @@ def _build_scene(path: Path, blocks: list[_Block]) -> dict:
             suffix = resolved.suffix.lower()
             if suffix == ".tscn":
                 edges.append(_edge(file_nid, tgt, "instances", path, loc, resolved))
-            elif suffix == ".tres":
+            elif suffix in (".tres", *_SHADER_SUFFIXES):
                 edges.append(_edge(file_nid, tgt, "uses_resource", path, loc, resolved,
                                    context=rtype or None))
             else:

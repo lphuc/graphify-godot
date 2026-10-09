@@ -57,6 +57,7 @@ from graphify.extractors.gdscript import (  # noqa: F401
     _PROJECT_CACHE as _GDSCRIPT_PROJECT_CACHE,
     _TYPE_INDEX_CACHE as _GDSCRIPT_TYPE_INDEX_CACHE,
 )
+from graphify.extractors.gdshader import extract_gdshader  # noqa: F401
 from graphify.extractors.godot_resource import (  # noqa: F401
     extract_godot_resource,
     _SCENE_TREE_CACHE as _GODOT_SCENE_TREE_CACHE,
@@ -3394,6 +3395,7 @@ _LANG_FAMILY_BY_EXT: dict[str, str] = {
     ".lua": "lua", ".luau": "lua",
     ".zig": "zig",
     ".gd": "gdscript",
+    ".gdshader": "gdshader", ".gdshaderinc": "gdshader",
     ".ex": "elixir", ".exs": "elixir",
     ".jl": "julia",
     ".dart": "dart",
@@ -7219,7 +7221,9 @@ def extract_xaml(path: Path) -> dict:
 # resolve `extends`, calls and signal wiring against OTHER files (the project's
 # class_name / autoload index, the functions of ancestor scripts), so a result
 # keyed by the file's own content goes stale as soon as one of those files changes.
-_CACHE_BYPASS_SUFFIXES = _JS_CACHE_BYPASS_SUFFIXES | {".gd", ".tscn", ".tres", ".godot"}
+# A shader's calls into the files it includes are read from those files likewise.
+_CACHE_BYPASS_SUFFIXES = _JS_CACHE_BYPASS_SUFFIXES | {
+    ".gd", ".tscn", ".tres", ".godot", ".gdshader", ".gdshaderinc"}
 
 _DISPATCH: dict[str, Any] = {
     ".py": extract_python,
@@ -7267,6 +7271,8 @@ _DISPATCH: dict[str, Any] = {
     ".tscn": extract_godot_resource,
     ".tres": extract_godot_resource,
     ".godot": extract_godot_resource,
+    ".gdshader": extract_gdshader,
+    ".gdshaderinc": extract_gdshader,
     ".ps1": extract_powershell,
     ".psm1": extract_powershell,
     ".psd1": extract_powershell_manifest,

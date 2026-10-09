@@ -354,6 +354,7 @@ To remove graphify from all platforms at once: `graphify uninstall` (add `--purg
 | Salesforce Apex | `.cls .trigger` (regex-based; classes, interfaces, enums, methods, triggers, SOQL/DML edges) |
 | Terraform / HCL | `.tf .tfvars .hcl` (requires `uv tool install graphifyy[terraform]`) |
 | Godot scenes / resources | `.tscn .tres project.godot` (no extra needed; scene -> script, scene -> sub-scene and scene -> resource edges, editor-made signal connections resolved to the script function, autoloads and the main scene; GDScript `preload`/`load` of a scene links to it) |
+| Godot shaders | `.gdshader .gdshaderinc` (no extra needed; functions, `#include` edges and calls into included files; scripts, scenes and materials link to the shader they load) |
 | OCaml | `.ml .mli` (requires `uv tool install graphifyy[ocaml]`) |
 | Common Lisp | `.lisp .cl .lsp .asd` (requires `uv tool install graphifyy[commonlisp]`) |
 | Robot Framework | `.robot .resource` (via the official `robot.api` parser, requires `uv tool install graphifyy[robot]`; suites, test cases, user keywords, keyword-call and Resource/Library/Variables import edges) |
