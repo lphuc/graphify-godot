@@ -161,20 +161,20 @@ def _resource_nid(path: Path) -> str:
 def _project_files(root: Path, suffixes: tuple[str, ...]):
     """Every file with one of ``suffixes`` under ``root`` that belongs to THIS project.
 
-    The engine does not look inside a directory holding ``.gdignore`` (its own
-    ``.godot`` cache, the Android build template, a staged addon update), and a
-    nested ``project.godot`` starts another project. A copy of a script left in
-    either must not claim a ``class_name`` or a ``uid://`` of the real one.
+    The engine does not look inside a hidden directory (its own ``.godot`` cache,
+    ``.git``, a tool's ``.backup``) or one holding ``.gdignore`` (the Android build
+    template, a staged addon update), and a nested ``project.godot`` starts another
+    project. A copy of a script left in any of them must not claim a
+    ``class_name`` or a ``uid://`` of the real one.
     """
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         if here != root and (".gdignore" in filenames or "project.godot" in filenames):
             dirnames[:] = []
             continue
-        if ".godot" in dirnames:
-            dirnames.remove(".godot")
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for name in filenames:
-            if name.endswith(suffixes):
+            if name.endswith(suffixes) and not name.startswith("."):
                 yield here / name
 
 
@@ -541,6 +541,7 @@ def extract_gdscript(path: Path) -> dict:
     inner_funcs: dict[str, dict[str, str]] = {}     # inner class nid -> its func name -> nid
     inner_names: dict[str, str] = {}                # inner class nid -> its name
     function_bodies: list[tuple[str, Any, Any, str]] = []   # (nid, body node, def node, owner nid)
+    member_types: list[tuple[str, str, int]] = []           # (owner nid, `var x: T` type, line)
     top_funcs: frozenset[str] = frozenset()
 
     def declare_member(node, owner_nid: str, owner_stem: str, inner: bool) -> None:
@@ -594,6 +595,9 @@ def extract_gdscript(path: Path) -> dict:
             return
         if t == "variable_statement":
             import_path(node)
+            kind = node.child_by_field_name("type")
+            if kind is not None and kind.type == "type":
+                member_types.append((owner_nid, _read_text(kind, source), line_of(node)))
             return
         if t == "enum_definition":
             name_node = node.child_by_field_name("name")
@@ -750,6 +754,16 @@ def extract_gdscript(path: Path) -> dict:
                 return other_symbol_nid(anc, name)
         return None
 
+    def resolve_super(name: str) -> str | None:
+        """Function ``name`` as ``super.name()`` / a bare ``super()`` reaches it:
+        looked up from the class the walked class extends, never in the class
+        itself — inside an override the call is not to the override."""
+        chain = _class_chain(self_cls, project)
+        if len(chain) < 2:
+            return None
+        holder, _ = _declared(chain[1], project, "funcs", name)
+        return member_nid(holder, name) if holder is not None else None
+
     def resolve_receiver(receiver: str) -> Path | None:
         if receiver in preload_alias:
             return preload_alias[receiver]
@@ -794,6 +808,22 @@ def extract_gdscript(path: Path) -> dict:
         if len(args) == 2 and (args[0] is not None or args[1] is not None):
             return ("dict", (args[0], args[1]))
         return None
+
+    # type annotations of the function being walked: (type, line), emitted once its
+    # body is walked, so a call's or `.new()`'s edge to the same class keeps its context
+    local_types: list[tuple[str, int]] = []
+
+    def reference_types(src_nid: str, type_name: str, line: int) -> None:
+        """A declaration typed with a project class (``Weapon``, ``Array[Item]``,
+        ``Dictionary[K, V]``) depends on that class. The script's own classes and
+        engine types give no edge."""
+        of = named_type(type_name, self_cls)
+        if of is None:
+            return
+        classes = [c for c in of[1] if c is not None] if of[0] == "dict" else [of[1]]
+        for cls in classes:
+            if cls[0] != self_script:
+                add_edge(src_nid, class_nid(cls), "references", line, context="type")
 
     def node_at(anchor: Path, ref) -> tuple | None:
         """The node the script ``anchor`` reaches by ``ref`` — a path (``A/B``) or
@@ -1081,6 +1111,7 @@ def extract_gdscript(path: Path) -> dict:
                         continue
                     if kind is not None:
                         env[_read_text(name, source)] = named_type(_read_text(kind, source), self_cls)
+                        local_types.append((_read_text(kind, source), line_of(p)))
                     elif p.type == "typed_default_parameter":       # `n := value`
                         env[_read_text(name, source)] = expr_type(p.children[-1])
                     else:
@@ -1092,6 +1123,8 @@ def extract_gdscript(path: Path) -> dict:
             if name is not None:
                 annotated = kind is not None and kind.type == "type"
                 declared = named_type(_read_text(kind, source), self_cls) if annotated else None
+                if annotated:
+                    local_types.append((_read_text(kind, source), line_of(node)))
                 if declared is None and value is not None:
                     # an engine annotation over a node (`var hud: Control = $Hud`)
                     # says less than the scene does; with no annotation the
@@ -1105,6 +1138,7 @@ def extract_gdscript(path: Path) -> dict:
             if named and named[0].type == "identifier":
                 if len(named) > 1 and named[1].type == "type":
                     kind = named_type(_read_text(named[1], source), self_cls)
+                    local_types.append((_read_text(named[1], source), line_of(node)))
                 else:
                     of = expr_type(named[-1]) if len(named) > 1 else None
                     kind = None
@@ -1201,7 +1235,7 @@ def extract_gdscript(path: Path) -> dict:
                 method = string_arg(args, 0)
 
             if on_self:
-                target = resolve_bare(method)
+                target = resolve_super(method) if names[0] == "super" else resolve_bare(method)
                 if target is not None:
                     add_edge(caller_nid, target, "calls", line, context="call")
                 else:
@@ -1233,6 +1267,14 @@ def extract_gdscript(path: Path) -> dict:
             return
         line = line_of(node)
         if fn in ("preload", "load"):
+            return
+        if fn == "super":
+            # `super(...)`: the parent's function of the name being defined
+            target = resolve_super(current_func)
+            if target is not None:
+                add_edge(caller_nid, target, "calls", line, context="call")
+            else:
+                unresolved_calls.append({"caller_nid": caller_nid, "callee": "super", "line": line})
             return
         if fn == "emit_signal" and args is not None:
             for a in args.children:
@@ -1316,14 +1358,27 @@ def extract_gdscript(path: Path) -> dict:
         if t == "variable_statement":
             declare(node)       # after its initialiser: `var hud = hud.child` reads the old hud
 
+    current_func = ""               # name of the function being walked, for `super()`
     for nid, body, definition, owner in function_bodies:
         scope = inner_funcs.get(owner, {})
         self_cls = (self_script, inner_names.get(owner, ""))
+        name_node = definition.child_by_field_name("name")
+        current_func = _read_text(name_node, source) if name_node is not None else "_init"
         env.clear()
+        local_types.clear()
         parameters = definition.child_by_field_name("parameters")
         if parameters is not None:
             declare(parameters)
+        returns = definition.child_by_field_name("return_type")
+        if returns is not None and returns.type == "type":
+            local_types.append((_read_text(returns, source), line_of(returns)))
         walk_calls(body, nid)
+        for type_name, line in local_types:
+            reference_types(nid, type_name, line)
+
+    for owner, type_name, line in member_types:
+        self_cls = (self_script, inner_names.get(owner, ""))
+        reference_types(owner, type_name, line)
 
     # --- pass 3: documentation citations in comments -----------------------------
     spans = [(d.start_byte, d.end_byte, nid) for nid, _b, d, _owner in function_bodies]

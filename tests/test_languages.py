@@ -5873,6 +5873,108 @@ def test_gdscript_inherits_and_ancestor_calls(tmp_path):
 
 
 @_needs_gdscript
+def test_gdscript_super_method_call_starts_at_the_parent(tmp_path):
+    """`super.f()` is the parent's f even where the script overrides f: inside
+    the override it would otherwise point at itself and be dropped as a self-loop,
+    elsewhere it would land on the override."""
+    root = _godot_project(tmp_path)
+    (root / "actors" / "actor.gd").write_text(
+        "extends Node\nclass_name Actor\n\n\nfunc setup(data) -> void:\n\tpass\n\n\n"
+        "func patrol() -> void:\n\tpass\n", encoding="utf-8")
+    grunt = root / "actors" / "grunt.gd"
+    grunt.write_text(
+        "extends Actor\n\n\nfunc setup(data) -> void:\n\tsuper.setup(data)\n\n\n"
+        "func patrol() -> void:\n\tpass\n\n\nfunc _ready() -> void:\n\tsuper.patrol()\n\n\n"
+        "class Fast extends Actor:\n\tfunc patrol() -> void:\n\t\tsuper.patrol()\n",
+        encoding="utf-8")
+
+    r = extract_gdscript(grunt)
+    setup = [e["target"] for e in _edges(r, "calls", "setup()")]
+    assert len(setup) == 1 and setup[0].endswith("_actor_setup")
+    ready = [e["target"] for e in _edges(r, "calls", "_ready()")]
+    assert len(ready) == 1 and ready[0].endswith("_actor_patrol")
+    # an inner class's super is the class it extends, not the script around it
+    fast = [e["target"] for e in _edges(r, "calls", ".patrol()")]
+    assert len(fast) == 1 and fast[0].endswith("_actor_patrol")
+    assert r["unresolved_calls"] == []
+
+
+@_needs_gdscript
+def test_gdscript_hidden_directories_never_claim_a_class_name(tmp_path):
+    """The engine skips every file and directory whose name starts with a dot, and
+    so does graphify's scan: a backup copy kept in one (`.backup/actor.gd`, sorted
+    before `actors/`) must not take the class_name from the real script."""
+    root = _godot_project(tmp_path)
+    for where in (root / ".backup", root / "actors"):
+        where.mkdir(exist_ok=True)
+        (where / "actor.gd").write_text("extends Node\nclass_name Actor\n", encoding="utf-8")
+    grunt = root / "actors" / "grunt.gd"
+    grunt.write_text("extends Actor\n\nvar target: Actor\n", encoding="utf-8")
+
+    from graphify.extract import _make_id
+
+    r = extract_gdscript(grunt)
+    real = _make_id(str(root / "actors" / "actor.gd"))
+    assert [e["target"] for e in _edges(r, "inherits", "grunt.gd")] == [real]
+    assert [e["target"] for e in _edges(r, "references", "grunt.gd")] == [real]
+
+
+@_needs_gdscript
+def test_gdscript_bare_super_calls_the_parent_function_of_the_same_name(tmp_path):
+    root = _godot_project(tmp_path)
+    (root / "actors" / "actor.gd").write_text(
+        "extends Node\nclass_name Actor\n\n\nfunc _init() -> void:\n\tpass\n\n\n"
+        "func reset(full: bool) -> void:\n\tpass\n", encoding="utf-8")
+    grunt = root / "actors" / "grunt.gd"
+    grunt.write_text(
+        "extends Actor\n\n\nfunc _init() -> void:\n\tsuper()\n\n\n"
+        "func reset(full: bool) -> void:\n\tsuper(full)\n\n\nfunc orphan() -> void:\n\tsuper()\n",
+        encoding="utf-8")
+
+    r = extract_gdscript(grunt)
+    init = [e["target"] for e in _edges(r, "calls", "_init()")]
+    assert len(init) == 1 and init[0].endswith("_actor_init")
+    reset = [e["target"] for e in _edges(r, "calls", "reset()")]
+    assert len(reset) == 1 and reset[0].endswith("_actor_reset")
+    # the parent has no orphan(): nothing to call, and it is counted as unresolved
+    assert _edges(r, "calls", "orphan()") == []
+    assert [u["callee"] for u in r["unresolved_calls"]] == ["super"]
+
+
+@_needs_gdscript
+def test_gdscript_type_annotations_reference_project_classes(tmp_path):
+    """A member var, a parameter, a return type or a local var typed with a
+    project class depends on that class: a `references` edge with context
+    "type". Engine and builtin types, and the script's own class, give none."""
+    root = _godot_project(tmp_path)
+    for name, cls, base in (("weapon", "Weapon", "Node"), ("item", "Item", "Resource"),
+                            ("char_data", "CharData", "Resource"), ("result", "Result", "RefCounted")):
+        (root / "actors" / f"{name}.gd").write_text(
+            f"extends {base}\nclass_name {cls}\n", encoding="utf-8")
+    player = root / "actors" / "player.gd"
+    player.write_text(
+        "extends Node\nclass_name Player\n\n"
+        "const Movement := preload(\"res://actors/movement.gd\")\n\n"
+        "var weapon: Weapon\n@export var items: Array[Item] = []\n"
+        "var speed: float = 1.0\nvar body: Node2D\n\n\n"
+        "func setup(data: CharData, n := 2) -> Result:\n\tvar helper: Movement = null\n\treturn null\n\n\n"
+        "func clone() -> Player:\n\treturn self\n",
+        encoding="utf-8")
+
+    r = extract_gdscript(player)
+    types = [e for e in _edges(r, "references") if e.get("context") == "type"]
+    by_source: dict[str, set[str]] = {}
+    for e in types:
+        by_source.setdefault(e["source"], set()).add(e["target"].rsplit("_", 2)[-2])
+    file_id = _by_label(r, "Player")["id"]
+    assert by_source == {
+        file_id: {"weapon", "item"},
+        _by_label(r, "setup()")["id"]: {"data", "result", "movement"},
+    }
+    assert all(e["confidence"] == "EXTRACTED" and e.get("target_file") for e in types)
+
+
+@_needs_gdscript
 def test_gdscript_autoload_scripts_wear_their_autoload_name(tmp_path):
     root = _godot_project(tmp_path)
     state = extract_gdscript(root / "autoload" / "game_state.gd")
